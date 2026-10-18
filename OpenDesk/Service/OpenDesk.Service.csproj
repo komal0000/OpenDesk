@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup><AssemblyName>OpenDesk.Service</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../Core/OpenDesk.Core.csproj" /><ProjectReference Include="../Relay/OpenDesk.Relay.csproj" /></ItemGroup>
+</Project>

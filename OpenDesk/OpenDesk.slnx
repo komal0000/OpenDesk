@@ -1,0 +1,20 @@
+<Solution>
+  <Folder Name="/App.Smoke/">
+    <Project Path="App.Smoke/OpenDesk.App.Smoke.csproj" />
+  </Folder>
+  <Folder Name="/App/">
+    <Project Path="App/OpenDesk.App.csproj" />
+  </Folder>
+  <Folder Name="/Core.Tests/">
+    <Project Path="Core.Tests/OpenDesk.Core.Tests.csproj" />
+  </Folder>
+  <Folder Name="/Core/">
+    <Project Path="Core/OpenDesk.Core.csproj" />
+  </Folder>
+  <Folder Name="/Relay/">
+    <Project Path="Relay/OpenDesk.Relay.csproj" />
+  </Folder>
+  <Folder Name="/Service/">
+    <Project Path="Service/OpenDesk.Service.csproj" />
+  </Folder>
+</Solution>

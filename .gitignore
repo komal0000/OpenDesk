@@ -1,0 +1,13 @@
+# Generated app outputs and local build state.
+**/bin/
+**/obj/
+**/artifacts/
+.vs/
+*.user
+
+# Local certificates and private keys.
+*.pfx
+*.pem
+
+# Extracted proprietary binary; analysis scripts/reports remain visible.
+/anydesk-payload.bin

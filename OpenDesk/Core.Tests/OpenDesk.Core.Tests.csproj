@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../Core/OpenDesk.Core.csproj" /><ProjectReference Include="../Relay/OpenDesk.Relay.csproj" /><ProjectReference Include="../Service/OpenDesk.Service.csproj" /></ItemGroup>
+</Project>

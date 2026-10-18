@@ -1,0 +1,19 @@
+{
+  "source": "C:\\Program Files (x86)\\AnyDesk\\AnyDesk.exe",
+  "source_sha256": "dd7aa730255da936af74821fe2e90cbeec20a06f543f1fabf924d129f526c014",
+  "packed_file_offset": 12800,
+  "packed_bytes": 3625610,
+  "lzma_properties": {
+    "lc": 3,
+    "lp": 0,
+    "pb": 2,
+    "dictionary": 67108864
+  },
+  "decoder_eof": false,
+  "unused_bytes": 0,
+  "derived_path": "A:\\REA\\Anydesk\\anydesk-payload.bin",
+  "derived_bytes": 10366464,
+  "derived_sha256": "b779bd2bea7f17a99e7b85c27733f12d83806aa3e94e46e0de1010cb0c4e0bd1",
+  "execution": "none",
+  "loader_expected_bytes": 10366464
+}

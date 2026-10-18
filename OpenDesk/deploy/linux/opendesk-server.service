@@ -1,0 +1,28 @@
+[Unit]
+Description=OpenDesk device directory and encrypted-session relay
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=opendesk
+Group=opendesk
+WorkingDirectory=/opt/opendesk
+ExecStart=/opt/opendesk/OpenDesk.Service --data /var/lib/opendesk --port 47834 --relay-port 47832
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+StateDirectory=opendesk
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/opendesk
+Environment=DOTNET_BUNDLE_EXTRACT_BASE_DIR=/var/lib/opendesk/bundle
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/opendesk
+
+[Install]
+WantedBy=multi-user.target
