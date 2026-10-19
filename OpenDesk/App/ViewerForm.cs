@@ -7,14 +7,11 @@ internal sealed class ViewerForm : Form
 {
     private readonly ViewerSession session;
     private readonly CancellationTokenSource stop = new();
-    private readonly RemoteScreen picture = new() { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, BackColor = Theme.Ink };
+    private readonly RemoteScreen picture = new() { Dock = DockStyle.Fill, BackColor = Theme.Ink };
     private readonly Label state = Theme.Label("Connected · View only", 10, true);
     private readonly CheckBox enableInput = new() { Text = "Send keyboard and mouse", AutoSize = true, Enabled = false, Margin = new Padding(12,12,12,4) };
     private readonly InputQueue inputs = new();
-    private sealed record DecodedFrame(ScreenFrame Frame,Bitmap Image);
-    private DecodedFrame? pending;
     private int displayPosted;
-    private Size imageSize;
     private long lastMove;
     private MouseButtons heldButtons;
     private Task? reading, sending;
@@ -22,9 +19,9 @@ internal sealed class ViewerForm : Form
     private readonly FileTransfer files;
     private MjpegRecording? recorder;
     private readonly object recordingGate=new();
-    private ScreenFrame? lastFrame;
+    private System.Threading.Timer? recordingTimer;
+    private long appliedEpoch=-1;
     private readonly Button fileButton=Theme.Button("Send file"),clipboardButton=Theme.Button("Send clipboard"),recordButton=Theme.Button("Record");
-    private long displayEpoch=-1;
     private bool fullScreen;
     private FormWindowState previousState;
     private Rectangle previousBounds;
@@ -67,7 +64,7 @@ internal sealed class ViewerForm : Form
             await session.DisposeAsync();
             if (reading is not null) { try { await reading; } catch (Exception) { } }
             if (sending is not null) { try { await sending; } catch (Exception) { } }
-            StopRecording();await files.DisposeAsync();chat?.Close();picture.Image?.Dispose();Interlocked.Exchange(ref pending,null)?.Image.Dispose();
+            StopRecording();await files.DisposeAsync();chat?.Close();
         };
     }
     protected override bool ProcessCmdKey(ref System.Windows.Forms.Message msg, Keys keyData)
@@ -92,14 +89,14 @@ internal sealed class ViewerForm : Form
     private void Pointer(MouseEventArgs e, string kind, bool down = false)
     {
         if (!enableInput.Checked || !session.Status.Control) return;
-        var point = ViewerCoordinates.Normalize(e.X, e.Y, picture.Width, picture.Height, imageSize.Width, imageSize.Height);
+        var image = picture.ImageSize;var point = ViewerCoordinates.Normalize(e.X, e.Y, picture.Width, picture.Height, image.Width, image.Height);
         if (point is null) { if (kind == "button" && !down) Queue(new("reset")); return; }
         int button = e.Button switch { MouseButtons.Left => 1, MouseButtons.Right => 2, MouseButtons.Middle => 3, _ => 0 };
         Queue(new(kind, point.Value.X, point.Value.Y, button, down, Delta:e.Delta));
     }
     private void Queue(InputEvent value)
     {
-        if (stop.IsCancellationRequested || !session.Status.Control || (value.Kind!="reset"&&displayEpoch!=session.Status.Epoch)) return;
+        if (stop.IsCancellationRequested || !session.Status.Control || (value.Kind!="reset"&&Volatile.Read(ref appliedEpoch)!=session.Status.Epoch)) return;
         if (!inputs.Post(value with { Epoch = session.Status.Epoch })) {
             enableInput.Checked = false; stop.Cancel(); Close();
         }
@@ -112,38 +109,42 @@ internal sealed class ViewerForm : Form
     private async Task ReadAsync()
     {
         bool hadControl=session.Status.Control;
-        try { await session.RunAsync(DecodeFrame, status => Ui(() => {
+        try { await session.RunAsync(frame=>Present(()=>picture.Apply(frame),frame.Epoch), status => Ui(() => {
             state.Text = status.Control ? "Connected · You have control" : "Connected · View only";
             enableInput.Enabled = status.Control;if(status.Control&&!hadControl)enableInput.Checked=true;if(!status.Control)enableInput.Checked=false;hadControl=status.Control;
             fileButton.Enabled=status.Files;clipboardButton.Enabled=status.Clipboard;
-        }), stop.Token); }
+        }), stop.Token, update=>Present(()=>picture.Apply(update),update.Epoch)); }
         catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException or InvalidDataException) {
             Ui(() => { state.Text = "Disconnected · Close this window to reconnect"; enableInput.Enabled = enableInput.Checked = false; });
         }
         finally { stop.Cancel(); await session.DisposeAsync(); }
     }
     private void Ui(Action action) { if (!IsDisposed && IsHandleCreated) { try { BeginInvoke(action); } catch (InvalidOperationException) { } } }
-    private void DecodeFrame(ScreenFrame frame)
+    // Reader thread: decode and paste into the surface, then let the UI repaint only what changed.
+    private void Present(Action apply,long epoch)
     {
         if(stop.IsCancellationRequested)return;
         var watch=System.Diagnostics.Stopwatch.StartNew();
         try {
-            if (JpegDimensions.Read(frame.Jpeg) != (frame.Width, frame.Height)) throw new InvalidDataException("Frame size mismatch.");
-            using var buffer = new MemoryStream(frame.Jpeg); using var decoded = Image.FromStream(buffer);
-            var next=new DecodedFrame(frame,new Bitmap(decoded));
-            LastDecodeMilliseconds=watch.Elapsed.TotalMilliseconds;
-            Interlocked.Exchange(ref pending,next)?.Image.Dispose();
-            lock(recordingGate){if(recorder is not null){try{recorder.Add(frame);}catch(Exception ex){StopRecording();Ui(()=>state.Text="Recording stopped: "+ex.Message);}}}
-            ScheduleDisplay();
+            apply();LastDecodeMilliseconds=watch.Elapsed.TotalMilliseconds;
+            Volatile.Write(ref appliedEpoch,epoch);ScheduleDisplay();
         } catch (Exception ex) when (ex is ArgumentException or InvalidDataException or OutOfMemoryException) {
             stop.Cancel();Ui(()=>state.Text = "Invalid screen frame · disconnected");
         }
     }
     private void ScheduleDisplay(){if(Interlocked.Exchange(ref displayPosted,1)==0)Ui(DisplayFrame);}
     private void DisplayFrame(){
-        var next=Interlocked.Exchange(ref pending,null);
-        if(next is not null){var old=picture.Image;picture.Image=next.Image;imageSize=next.Image.Size;old?.Dispose();lastFrame=next.Frame;displayEpoch=next.Frame.Epoch;RenderedFrames++;}
-        Interlocked.Exchange(ref displayPosted,0);if(Volatile.Read(ref pending)is not null)ScheduleDisplay();
+        Interlocked.Exchange(ref displayPosted,0);
+        picture.InvalidateChanges();RenderedFrames++;
+    }
+    // Tile updates arrive only when something changes, so record from the surface at a steady rate.
+    private void RecordFrame()
+    {
+        lock(recordingGate){
+            if(recorder is null)return;
+            try{if(picture.EncodeFrame() is {} frame)recorder.Add(frame);}
+            catch(Exception ex)when(ex is IOException or InvalidOperationException or ArgumentException or ObjectDisposedException){StopRecording();Ui(()=>state.Text="Recording stopped: "+ex.Message);}
+        }
     }
     private void OpenChat(){if(chat is null||chat.IsDisposed)chat=new ChatForm(Text,text=>session.SendMessageAsync(Wire.Json(MessageKind.Chat,text),stop.Token));if(!chat.Visible)chat.Show(this);else chat.Activate();}
     private async Task ReceiveMessageAsync(OpenDesk.Core.Message message,CancellationToken ct)
@@ -155,17 +156,17 @@ internal sealed class ViewerForm : Form
     }
     private void SaveScreenshot()
     {
-        if(picture.Image is null)return;using var image=new Bitmap(picture.Image);using var dialog=new SaveFileDialog{Filter="PNG image|*.png",FileName="OpenDesk-"+DateTime.Now.ToString("yyyyMMdd-HHmmss")+".png",OverwritePrompt=true};if(dialog.ShowDialog(this)==DialogResult.OK){try{image.Save(dialog.FileName,System.Drawing.Imaging.ImageFormat.Png);}catch(Exception ex){state.Text=ex.Message;}}
+        using var image=picture.Snapshot();if(image is null)return;using var dialog=new SaveFileDialog{Filter="PNG image|*.png",FileName="OpenDesk-"+DateTime.Now.ToString("yyyyMMdd-HHmmss")+".png",OverwritePrompt=true};if(dialog.ShowDialog(this)==DialogResult.OK){try{image.Save(dialog.FileName,System.Drawing.Imaging.ImageFormat.Png);}catch(Exception ex){state.Text=ex.Message;}}
     }
     private void ToggleRecording()
     {
         if(recorder is not null){StopRecording();return;}
-        if(lastFrame is null)return;using var dialog=new SaveFileDialog{Filter="Motion JPEG video|*.avi",FileName="OpenDesk-"+DateTime.Now.ToString("yyyyMMdd-HHmmss")+".avi",OverwritePrompt=true};if(dialog.ShowDialog(this)==DialogResult.OK){try{lock(recordingGate)recorder=new(dialog.FileName,lastFrame.Width,lastFrame.Height);recordButton.Text="Stop recording";state.Text="Recording session…";}catch(Exception ex){state.Text=ex.Message;}}
+        var size=picture.ImageSize;if(size.IsEmpty)return;using var dialog=new SaveFileDialog{Filter="Motion JPEG video|*.avi",FileName="OpenDesk-"+DateTime.Now.ToString("yyyyMMdd-HHmmss")+".avi",OverwritePrompt=true};if(dialog.ShowDialog(this)==DialogResult.OK){try{lock(recordingGate){recorder=new(dialog.FileName,size.Width,size.Height);recordingTimer??=new(_=>RecordFrame(),null,0,100);}recordButton.Text="Stop recording";state.Text="Recording session…";}catch(Exception ex){state.Text=ex.Message;}}
     }
     private void ToggleFullscreen()
     {
         if(!fullScreen){previousState=WindowState;previousBounds=Bounds;FormBorderStyle=FormBorderStyle.None;WindowState=FormWindowState.Normal;Bounds=Screen.FromControl(this).Bounds;fullScreen=true;}
         else{FormBorderStyle=FormBorderStyle.Sizable;WindowState=FormWindowState.Normal;Bounds=previousBounds;WindowState=previousState;fullScreen=false;}
     }
-    private void StopRecording(){lock(recordingGate){var active=recorder;recorder=null;Ui(()=>recordButton.Text="Record");if(active is null)return;try{active.Dispose();Ui(()=>state.Text="Recording saved");}catch(Exception ex)when(ex is IOException or UnauthorizedAccessException){Ui(()=>state.Text="Recording could not be finalized: "+ex.Message);}}}
+    private void StopRecording(){lock(recordingGate){var active=recorder;recorder=null;recordingTimer?.Dispose();recordingTimer=null;Ui(()=>recordButton.Text="Record");if(active is null)return;try{active.Dispose();Ui(()=>state.Text="Recording saved");}catch(Exception ex)when(ex is IOException or UnauthorizedAccessException){Ui(()=>state.Text="Recording could not be finalized: "+ex.Message);}}}
 }

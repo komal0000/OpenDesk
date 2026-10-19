@@ -166,7 +166,7 @@ internal sealed class MainForm : Form
             if(info.Protocol!=1 || info.RelayPort is <1 or >65535)throw new InvalidDataException("Unsupported device service.");
             var loadedKey=await Task.Run(deviceKeyFactory);if(token.IsCancellationRequested){loadedKey.Dispose();return;}deviceKey=loadedKey;var screen=screens[monitor.SelectedIndex];var profile=CaptureProfile();desktop=new(screen.Bounds,profile.Width,profile.Quality);
             var source=desktop;int capacity=(int)limit.Value;
-            var createdHost=await Task.Run(()=>new HostService(source.Capture,inputOverride??new WindowsInput(()=>source.Bounds),RequestApprovalAsync,capacity));
+            var createdHost=await Task.Run(()=>new HostService(source,inputOverride??new WindowsInput(()=>source.Bounds),RequestApprovalAsync,capacity));
             if(token.IsCancellationRequested){await createdHost.DisposeAsync();return;}host=createdHost;
             host.MessageReceived=ReceiveMessageAsync;
             host.PeerDisconnected+=id=>{if(transfers.TryRemove(id,out var file))fileCleanup.Add(file.DisposeAsync().AsTask());Ui(()=>{if(chats.TryGetValue(id,out var chat))chat.Append("System","Viewer disconnected");});};
@@ -203,7 +203,7 @@ internal sealed class MainForm : Form
         try{
             string id=DeviceProof.NormalizeId(remote.Text);using var lookup=new DirectoryClient(settings.ServiceUrl,settings.ServicePin);bottom.Text="Finding " + DeviceProof.FormatId(id) + "…";
             var route=await lookup.LookupAsync(id,joining.Token);bottom.Text="Waiting for the remote host to approve…";
-            var session=await ViewerSession.ConnectAsync(route.Session,settings.DisplayName,joining.Token);
+            var session=await ViewerSession.ConnectAsync(route.Session,settings.DisplayName,joining.Token,true);
             settings.Remember(id,DeviceProof.FormatId(id));if(currentPage=="home")ShowPage("home");var window=new ViewerForm(session,DeviceProof.FormatId(id)){Opacity=Opacity,ShowInTaskbar=ShowInTaskbar};windows.Add(window);window.FormClosed+=(_,_)=>{windows.Remove(window);window.Dispose();};window.Show();bottom.Text="Connected to " + DeviceProof.FormatId(id);
         }catch(OperationCanceledException){bottom.Text="Connection cancelled or timed out";}catch(Exception ex){ShowError(ex.Message);bottom.Text="Connection ended";}
         finally{joining.Dispose();joining=null;connect.Enabled=true;}
@@ -217,7 +217,7 @@ internal sealed class MainForm : Form
     }
     private void Preview()
     {
-        try{var profile=CaptureProfile();using var capture=new ScreenCapture(screens[monitor.SelectedIndex].Bounds,profile.Width,profile.Quality);var f=capture.Capture();using var buffer=new MemoryStream(f.Jpeg);using var decoded=Image.FromStream(buffer);var image=new Bitmap(decoded);var window=new Form{Text="OpenDesk · Display preview",ClientSize=new(800,500)};window.Controls.Add(new PictureBox{Dock=DockStyle.Fill,SizeMode=PictureBoxSizeMode.Zoom,Image=image});window.FormClosed+=(_,_)=>{image.Dispose();window.Dispose();};window.Show(this);}catch(Exception ex){ShowError(ex.Message);}
+        try{var profile=CaptureProfile();using var capture=new ScreenCapture(screens[monitor.SelectedIndex].Bounds,profile.Width,profile.Quality);var f=capture.Frame();using var buffer=new MemoryStream(f.Jpeg);using var decoded=Image.FromStream(buffer);var image=new Bitmap(decoded);var window=new Form{Text="OpenDesk · Display preview",ClientSize=new(800,500)};window.Controls.Add(new PictureBox{Dock=DockStyle.Fill,SizeMode=PictureBoxSizeMode.Zoom,Image=image});window.FormClosed+=(_,_)=>{image.Dispose();window.Dispose();};window.Show(this);}catch(Exception ex){ShowError(ex.Message);}
     }
     private FileTransfer Files(Guid id)=>transfers.GetOrAdd(id,_=>{var files=new FileTransfer((message,ct)=>host!.SendMessageAsync(id,message,ct),(offer,ct)=>SessionFiles.ChooseSaveAsync(this,offer,ct));files.Notice+=text=>Ui(()=>bottom.Text=text);return files;});
     private void OpenChat(Guid id)

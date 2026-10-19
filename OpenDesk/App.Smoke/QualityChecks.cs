@@ -13,7 +13,7 @@ internal static class QualityChecks
         var timings=new List<double>();int bytes=0;
         using var animation=new Form{Text="OpenDesk capture benchmark",ClientSize=new(320,180),StartPosition=FormStartPosition.Manual,Location=new(30,30),TopMost=true,ShowInTaskbar=false};animation.Show();
         using(var capture=new CaptureScope(Screen.PrimaryScreen!.Bounds)){
-            for(int i=0;i<35;i++) { animation.BackColor=Color.FromArgb(i*7%255,i*13%255,i*19%255);animation.Refresh();var watch=Stopwatch.StartNew();var frame=capture.Source.Capture();watch.Stop();if(i>4)timings.Add(watch.Elapsed.TotalMilliseconds);bytes=frame.Jpeg.Length; }
+            for(int i=0;i<35;i++) { animation.BackColor=Color.FromArgb(i*7%255,i*13%255,i*19%255);animation.Refresh();await Task.Delay(20);var watch=Stopwatch.StartNew();capture.Source.Capture();var frame=capture.Source.Frame();watch.Stop();if(i>4)timings.Add(watch.Elapsed.TotalMilliseconds);bytes=frame.Jpeg.Length; }
         }
         animation.Close();
         timings.Sort();results.Add($"Capture+encode p50={timings[timings.Count/2]:F1} ms p95={timings[(int)(timings.Count*.95)]:F1} ms JPEG={bytes} bytes");

@@ -15,7 +15,7 @@ public sealed class ViewerSession : IAsyncDisposable
     public SessionStatus Status { get => Volatile.Read(ref currentStatus); private set => Volatile.Write(ref currentStatus, value); }
     private ViewerSession(TcpClient client, SslStream stream, SessionStatus status) { this.client = client; this.stream = stream; currentStatus = status; }
 
-    public static async Task<ViewerSession> ConnectAsync(Invitation invitation, string name, CancellationToken ct)
+    public static async Task<ViewerSession> ConnectAsync(Invitation invitation, string name, CancellationToken ct, bool tiles = false)
     {
         _ = Invitation.Parse(invitation.Encode(), DateTimeOffset.UtcNow);
         var client = new TcpClient();
@@ -23,7 +23,7 @@ public sealed class ViewerSession : IAsyncDisposable
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct); deadline.CancelAfter(TimeSpan.FromSeconds(15));
             await client.ConnectAsync(invitation.Address, invitation.Port, deadline.Token); client.NoDelay = true;
             if (invitation.Mode == "relay") await RelayProtocol.JoinViewerAsync(client.GetStream(), invitation.Room, deadline.Token);
-            var ssl = await SecureSession.OpenClientAsync(client.GetStream(), invitation, name, ct,true);
+            var ssl = await SecureSession.OpenClientAsync(client.GetStream(), invitation, name, ct,true,tiles);
             try {
                 using var approvalWait = CancellationTokenSource.CreateLinkedTokenSource(ct); approvalWait.CancelAfter(TimeSpan.FromSeconds(65));
                 var message = await Wire.ReadAsync(ssl, approvalWait.Token);
@@ -41,7 +41,7 @@ public sealed class ViewerSession : IAsyncDisposable
         try { await Wire.WriteAsync(stream, message, deadline.Token); }
         finally { writing.Release(); }
     }
-    public async Task RunAsync(Action<ScreenFrame> frame, Action<SessionStatus> status, CancellationToken ct)
+    public async Task RunAsync(Action<ScreenFrame> frame, Action<SessionStatus> status, CancellationToken ct, Action<TileUpdate>? tiles = null)
     {
         using var running = CancellationTokenSource.CreateLinkedTokenSource(ct, stop.Token);
         var heartbeat = HeartbeatAsync(running.Token);
@@ -50,13 +50,17 @@ public sealed class ViewerSession : IAsyncDisposable
             var textBudget=new TextBudget();
             while (!running.IsCancellationRequested) {
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(running.Token); deadline.CancelAfter(TimeSpan.FromSeconds(35));
-                var message = await Wire.ReadAsync(stream, deadline.Token);
+                var (message, headerArrived) = await Wire.ReadTimedAsync(stream, deadline.Token);
+                long received = System.Diagnostics.Stopwatch.GetTimestamp();
                 textBudget.Check(message);
-                if (message.Kind == MessageKind.Frame) {
-                    var decoded = ScreenFrame.Unpack(message);
-                    if (decoded.Status.Epoch >= Status.Epoch) { var next=Status with {Control=decoded.Status.Control,Epoch=decoded.Status.Epoch};if(Status!=next){Status=next;status(Status);} }
-                    frame(decoded.Frame);
-                    if(Status.FrameAcks)await WriteAsync(new(MessageKind.FrameAck,[]),running.Token);
+                if (message.Kind is MessageKind.Frame or MessageKind.Tiles) {
+                    SessionStatus frameStatus;Action deliver;
+                    if(message.Kind==MessageKind.Frame){var decoded=ScreenFrame.Unpack(message);frameStatus=decoded.Status;deliver=()=>frame(decoded.Frame);}
+                    else{if(tiles is null)throw new InvalidDataException("Unexpected host message.");var decoded=TileUpdate.Unpack(message);frameStatus=decoded.Status;deliver=()=>tiles(decoded.Update);}
+                    if (frameStatus.Epoch >= Status.Epoch) { var next=Status with {Control=frameStatus.Control,Epoch=frameStatus.Epoch};if(Status!=next){Status=next;status(Status);} }
+                    deliver();
+                    if(Status.Tiles)await WriteAsync(new(MessageKind.FrameAck,AckTiming(headerArrived,received)),running.Token);
+                    else if(Status.FrameAcks)await WriteAsync(new(MessageKind.FrameAck,[]),running.Token);
                 }
                 else if (message.Kind == MessageKind.Status) { var next = Wire.Decode<SessionStatus>(message); if (next.Epoch >= Status.Epoch) { Status = next; status(Status); } }
                 else if(message.Kind is MessageKind.Chat or MessageKind.Clipboard or MessageKind.FileOffer or MessageKind.FileChunk or MessageKind.FileFinish or MessageKind.FileAck) {
@@ -67,6 +71,15 @@ public sealed class ViewerSession : IAsyncDisposable
             }
         }
         finally { running.Cancel(); try { await heartbeat; } catch (Exception ex) when (ex is OperationCanceledException or IOException or ObjectDisposedException) { } }
+    }
+    // Milliseconds from the frame header arriving to the payload arriving, and to this acknowledgment.
+    private static byte[] AckTiming(long headerArrived, long received)
+    {
+        static ushort Ms(long from, long to) => (ushort)Math.Clamp(System.Diagnostics.Stopwatch.GetElapsedTime(from, to).TotalMilliseconds, 0, ushort.MaxValue);
+        var ack = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(ack, Ms(headerArrived, received));
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(ack.AsSpan(2), Ms(headerArrived, System.Diagnostics.Stopwatch.GetTimestamp()));
+        return ack;
     }
     private async Task HeartbeatAsync(CancellationToken ct)
     {

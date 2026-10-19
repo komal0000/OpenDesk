@@ -19,6 +19,9 @@ internal static class Program
             if(args.Contains("--input-local")||args.Contains("--input-public")){
                 try{await InputChecks.RunAsync(args.Contains("--input-public"));}catch(Exception ex){File.WriteAllText(Path.Combine(AppContext.BaseDirectory,"input-failure.txt"),ex.ToString());Environment.ExitCode=1;}finally{root.Close();}return;
             }
+            if(args.Contains("--perf")){
+                try{await PerfChecks.RunAsync();}catch(Exception ex){File.WriteAllText(Path.Combine(AppContext.BaseDirectory,"perf-failure.txt"),ex.ToString());Environment.ExitCode=1;}finally{root.Close();}return;
+            }
             if(args.Contains("--quality")){
                 try{await QualityChecks.RunAsync();}catch(Exception ex){File.WriteAllText(Path.Combine(AppContext.BaseDirectory,"quality-failure.txt"),ex.ToString());Environment.ExitCode=1;}finally{root.Close();}return;
             }
@@ -67,7 +70,7 @@ internal static class Program
                 var events=observed.Events.ToArray();if(events.Length!=40||events.Where((e,i)=>e.Kind!="button"||e.Code!=1||e.Down!=(i%2==0)||Math.Abs(e.X-.5)>.01||Math.Abs(e.Y-.5)>.01).Any())throw new Exception("Viewer click forwarding mismatch");
                 using(var image=new Bitmap(host.Width,host.Height)){host.DrawToBitmap(image,new Rectangle(Point.Empty,host.Size));image.Save(Path.Combine(AppContext.BaseDirectory,"home-online-smoke.png"));}
                 if(viewerSettings.Contacts.All(c=>c.Id!=host.DeviceAddress))throw new Exception("Recent session was not stored");
-                using var capture=new ScreenCapture(Screen.PrimaryScreen!.Bounds);var frame=capture.Capture();
+                using var capture=new ScreenCapture(Screen.PrimaryScreen!.Bounds);var frame=capture.Frame();
                 using(var recording=new MjpegRecording(Path.Combine(AppContext.BaseDirectory,"recording-smoke.avi"),frame.Width,frame.Height)){for(int i=0;i<3;i++){recording.Add(frame);await Task.Delay(100);}}
                 File.WriteAllText(Path.Combine(AppContext.BaseDirectory,"session-smoke.txt"),$"PASS two actual Windows app homes -> distinct persistent numeric IDs -> HTTPS lookup -> Connect button -> real Allow control dialog -> relay -> pinned TLS -> capture -> viewer rendering; control active immediately; 20/20 viewer-surface clicks received in order at host; {viewer.RenderedFrames} frames; first frame {firstFrame:F0} ms after approval (target <1000); decode {viewer.LastDecodeMilliseconds:F1} ms off UI thread; recent session stored; no OS input injected in this test.");
                 if(firstFrame>=1000)Environment.ExitCode=2;

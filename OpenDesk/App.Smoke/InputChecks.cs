@@ -21,7 +21,7 @@ internal static class InputChecks
         using var target=Process.Start(start)!;Point original=Cursor.Position;
         using var ct=new CancellationTokenSource(TimeSpan.FromSeconds(35));
         var bounds=Screen.PrimaryScreen!.Bounds;using var capture=new ScreenCapture(bounds);
-        await using var host=new HostService(capture.Capture,new WindowsInput(bounds),(_,_)=>Task.FromResult(new Approval(true,true)));
+        await using var host=new HostService(capture,new WindowsInput(bounds),(_,_)=>Task.FromResult(new Approval(true,true)));
         ViewerSession? session=null;Task? reading=null;
         try{
             if(publicRelay)await host.StartRelayAsync("139.99.135.69",47832);else host.StartDirect("127.0.0.1",0,IPAddress.Loopback);

@@ -6,6 +6,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyName>OpenDesk</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../Core/OpenDesk.Core.csproj" /></ItemGroup>
 </Project>

@@ -9,7 +9,7 @@ internal static class Program
         Application.AddMessageFilter(new RemoteInputFilter());
         if (args.Contains("--capture-smoke")) {
             try {
-                using var capture=new ScreenCapture(Screen.PrimaryScreen!.Bounds);var frame = capture.Capture();
+                using var capture=new ScreenCapture(Screen.PrimaryScreen!.Bounds);var frame = capture.Frame();
                 var dimensions = OpenDesk.Core.JpegDimensions.Read(frame.Jpeg);
                 if (dimensions != (frame.Width, frame.Height)) throw new InvalidDataException("Capture dimensions differ.");
                 File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "capture-smoke.txt"), $"PASS {frame.Width}x{frame.Height}, {frame.Jpeg.Length} encoded bytes");

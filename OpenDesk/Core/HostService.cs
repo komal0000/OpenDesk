@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -10,7 +11,8 @@ namespace OpenDesk.Core;
 
 public sealed partial class HostService : IAsyncDisposable
 {
-    private readonly Func<ScreenFrame> capture;
+    private readonly IScreenSource source;
+    private readonly bool tiles = true;
     private readonly Func<string, CancellationToken, Task<Approval>> approve;
     private readonly X509Certificate2 certificate = SecureSession.CreateCertificate();
     private readonly CancellationTokenSource stop = new();
@@ -29,11 +31,16 @@ public sealed partial class HostService : IAsyncDisposable
     public Func<Guid,Message,CancellationToken,Task>? MessageReceived { get; set; }
     public event Action<Guid>? PeerDisconnected;
 
-    private sealed class Peer(Guid id, CancellationTokenSource cancel, bool frameAcks)
+    private sealed class Peer(Guid id, CancellationTokenSource cancel, bool frameAcks, bool tiles)
     {
         public bool FrameAcks {get;}=frameAcks;
+        // Tile viewers get deltas against what they already hold, paced by FramePacer.
+        public bool Tiles {get;}=frameAcks&&tiles;
+        public FramePacer Pacer {get;}=new();
+        public long Sent, SentEpoch=-1, LastSent;
         public int InFlight;
-        public int HasPublished;
+        // Whole frames replace each other; deltas must wait until the previous one is sent and paced.
+        public bool Ready => !Tiles || Volatile.Read(ref Frame) is null && Pacer.CanSend();
         public Guid Id { get; } = id;
         public CancellationTokenSource Cancel { get; } = cancel;
         public void Stop() { try { Cancel.Cancel(); } catch (ObjectDisposedException) { } }
@@ -41,12 +48,14 @@ public sealed partial class HostService : IAsyncDisposable
         public Channel<byte> Wake { get; } = Channel.CreateBounded<byte>(new BoundedChannelOptions(1) { FullMode=BoundedChannelFullMode.DropWrite });
         public Message? Frame;
         public void Post(Message message) { if(!Reliable.Writer.TryWrite(message))Stop(); else Wake.Writer.TryWrite(1); }
-        public void Publish(Message message) { Volatile.Write(ref HasPublished,1);Interlocked.Exchange(ref Frame,message);Wake.Writer.TryWrite(1); }
+        public void Publish(Message message) { Interlocked.Exchange(ref Frame,message);Wake.Writer.TryWrite(1); }
     }
 
     public HostService(Func<ScreenFrame> capture, IInputSink input, Func<string, CancellationToken, Task<Approval>> approve, int capacity = 5)
+        : this(new FrameSource(capture), input, approve, capacity) { tiles = false; }
+    public HostService(IScreenSource source, IInputSink input, Func<string, CancellationToken, Task<Approval>> approve, int capacity = 5)
     {
-        this.capture = capture; this.approve = approve;
+        this.source = source; this.approve = approve;
         Coordinator = new(input, capacity); admission = new(capacity + 4, capacity + 4);
         Coordinator.Changed += OnCoordinatorChanged;
     }
@@ -100,11 +109,11 @@ public sealed partial class HostService : IAsyncDisposable
         Guid id;
         try { id = Coordinator.Add(authenticated.Name, decision.Control,decision.Clipboard,decision.Files); }
         catch (InvalidOperationException) { await Wire.WriteAsync(ssl, Wire.Json(MessageKind.Rejected, "Viewer capacity reached."), ct); return; }
-        var peer = new Peer(id, peerStop,authenticated.FrameAcks); peers[id] = peer;
+        var peer = new Peer(id, peerStop,authenticated.FrameAcks,authenticated.Tiles&&tiles); peers[id] = peer;
         try {
             using var initialWrite = CancellationTokenSource.CreateLinkedTokenSource(peerStop.Token);
             initialWrite.CancelAfter(TimeSpan.FromSeconds(5));
-            await Wire.WriteAsync(ssl, Wire.Json(MessageKind.Accepted, Coordinator.Status(id) with{FrameAcks=peer.FrameAcks}), initialWrite.Token);
+            await Wire.WriteAsync(ssl, Wire.Json(MessageKind.Accepted, StatusFor(peer)), initialWrite.Token);
             var sending = SendAsync(); var reading = ReadAsync();
             await Task.WhenAny(sending, reading); peerStop.Cancel(); await Task.WhenAll(sending, reading);
 
@@ -113,8 +122,9 @@ public sealed partial class HostService : IAsyncDisposable
                 while(await peer.Wake.Reader.WaitToReadAsync(peerStop.Token)) {
                     peer.Wake.Reader.TryRead(out _);
                     for(int batch=0;batch<4&&peer.Reliable.Reader.TryRead(out var reliable);batch++)await Write(reliable);
-                    if(!peer.FrameAcks||Volatile.Read(ref peer.InFlight)<2){
-                        var frame=Interlocked.Exchange(ref peer.Frame,null);if(frame is not null){if(peer.FrameAcks)Interlocked.Increment(ref peer.InFlight);await Write(frame);}
+                    if(peer.Tiles||!peer.FrameAcks||Volatile.Read(ref peer.InFlight)<2){
+                        var frame=Interlocked.Exchange(ref peer.Frame,null);
+                        if(frame is not null){if(peer.Tiles)peer.Pacer.OnSend(frame.Payload.Length+5,FramePacer.Now);else if(peer.FrameAcks)Interlocked.Increment(ref peer.InFlight);await Write(frame);}
                     }
                     if(peer.Reliable.Reader.TryPeek(out _))peer.Wake.Writer.TryWrite(1);
                 }
@@ -136,7 +146,11 @@ public sealed partial class HostService : IAsyncDisposable
                         }
                     }
                     else if(message.Kind==MessageKind.FrameAck){
-                        if(!peer.FrameAcks||message.Payload.Length!=0||Interlocked.Decrement(ref peer.InFlight)<0)throw new InvalidDataException("Unexpected frame acknowledgment.");
+                        // Tile viewers report milliseconds spent receiving and holding the frame.
+                        bool valid=peer.Tiles
+                            ?message.Payload.Length==4&&peer.Pacer.OnAck(FramePacer.Now,BinaryPrimitives.ReadUInt16BigEndian(message.Payload),BinaryPrimitives.ReadUInt16BigEndian(message.Payload.AsSpan(2)))
+                            :peer.FrameAcks&&message.Payload.Length==0&&Interlocked.Decrement(ref peer.InFlight)>=0;
+                        if(!valid)throw new InvalidDataException("Unexpected frame acknowledgment.");
                         peer.Wake.Writer.TryWrite(1);
                     }
                     else if(message.Kind is MessageKind.Chat or MessageKind.Clipboard or MessageKind.FileOffer or MessageKind.FileChunk or MessageKind.FileFinish or MessageKind.FileAck) {
@@ -150,26 +164,33 @@ public sealed partial class HostService : IAsyncDisposable
         }
         finally { peerStop.Cancel(); peers.TryRemove(id, out _); Coordinator.Remove(id);PeerDisconnected?.Invoke(id); }
     }
+    private SessionStatus StatusFor(Peer peer) => Coordinator.Status(peer.Id) with { FrameAcks = peer.FrameAcks, Tiles = peer.Tiles };
     private void OnCoordinatorChanged()
     {
         var connected = Coordinator.Viewers.Select(v => v.Id).ToHashSet();
         foreach (var peer in peers.Values) {
             if (!connected.Contains(peer.Id)) peer.Stop();
-            else peer.Post(Wire.Json(MessageKind.Status, Coordinator.Status(peer.Id) with{FrameAcks=peer.FrameAcks}));
+            else peer.Post(Wire.Json(MessageKind.Status, StatusFor(peer)));
         }
     }
     private async Task CaptureAsync()
     {
         try {
-            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(33));
-            ScreenFrame? previous=null;long previousEpoch=-1,lastPublished=0;
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(16));
+            var updates=new Dictionary<long,TileUpdate>();
             while (await timer.WaitForNextTickAsync(stop.Token)) {
-                if (peers.IsEmpty) continue;
-                long epoch=Coordinator.Status(Guid.Empty).Epoch;var frame = capture();
-                long now=Environment.TickCount64;
-                if(ReferenceEquals(previous,frame)&&epoch==previousEpoch&&now-lastPublished<2000&&peers.Values.All(p=>Volatile.Read(ref p.HasPublished)!=0))continue;
-                previous=frame;previousEpoch=epoch;lastPublished=now;
-                foreach (var peer in peers.Values){var status=Coordinator.Status(peer.Id);if(status.Epoch==epoch)peer.Publish(frame.Pack(status));}
+                // Capture only when some viewer can take a frame; duplication merges the changes meanwhile.
+                if (peers.All(p => !p.Value.Ready)) continue;
+                long epoch=Coordinator.Status(Guid.Empty).Epoch,sequence=source.Capture(),now=Environment.TickCount64;
+                ScreenFrame? full=null;updates.Clear();
+                foreach (var peer in peers.Values){
+                    var status=Coordinator.Status(peer.Id);
+                    // An unchanged screen is resent every 2 s: it carries the epoch and keeps idle sessions alive.
+                    if(status.Epoch!=epoch||!peer.Ready||peer.Sent==sequence&&peer.SentEpoch==epoch&&now-peer.LastSent<2000)continue;
+                    if(peer.Tiles){if(!updates.TryGetValue(peer.Sent,out var update))updates[peer.Sent]=update=source.Changes(peer.Sent);peer.Publish(update.Pack(status));peer.Sent=update.Sequence;}
+                    else{peer.Publish((full??=source.Frame()).Pack(status));peer.Sent=sequence;}
+                    peer.SentEpoch=epoch;peer.LastSent=now;
+                }
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
@@ -177,6 +198,15 @@ public sealed partial class HostService : IAsyncDisposable
             stop.Cancel(); listener?.Stop(); Coordinator.Stop();
             Notice?.Invoke("Screen capture stopped. Check the selected display, then stop and restart hosting.");
         }
+    }
+    // Whole-frame source (tests, old callers): a new frame object means new content; no tiles.
+    private sealed class FrameSource(Func<ScreenFrame> capture) : IScreenSource
+    {
+        private ScreenFrame? last;
+        private long sequence;
+        public long Capture(){var next=capture();if(!ReferenceEquals(next,last)){last=next;sequence++;}return sequence;}
+        public ScreenFrame Frame()=>last??=capture();
+        public TileUpdate Changes(long since)=>throw new NotSupportedException();
     }
     public async ValueTask DisposeAsync()
     {

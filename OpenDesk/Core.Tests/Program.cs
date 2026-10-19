@@ -62,5 +62,5 @@ internal static class Program
         Console.WriteLine($"{Cases.Count - failures}/{Cases.Count} passed");
         return failures == 0 ? 0 : 1;
     }
-    private static void AddAdditionalTests() { SecurityTests.Register(); CoordinatorTests.Register(); SessionTests.Register(); RelayTests.Register(); AdversarialTests.Register(); DirectoryTests.Register(); DirectoryIntegrationTests.Register(); SessionToolsTests.Register(); LatencyTests.Register(); }
+    private static void AddAdditionalTests() { SecurityTests.Register(); CoordinatorTests.Register(); SessionTests.Register(); RelayTests.Register(); AdversarialTests.Register(); DirectoryTests.Register(); DirectoryIntegrationTests.Register(); SessionToolsTests.Register(); LatencyTests.Register(); VideoTests.Register(); }
 }
