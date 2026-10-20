@@ -10,19 +10,23 @@ internal sealed class ServiceSettingsForm : Form
     private readonly TextBox name = new() { Width=300, MaxLength=64 };
     internal ServiceSettingsForm(ClientSettings settings)
     {
+        SuspendLayout();
         AutoScaleDimensions=new(96,96);AutoScaleMode=AutoScaleMode.Dpi;
         this.settings=settings; Text="OpenDesk · Network settings"; ClientSize=new(660,580);MinimumSize=new(560,480); StartPosition=FormStartPosition.CenterParent;
-        Font=new Font("Segoe UI",10); var panel=Theme.Stack();
-        panel.Controls.Add(Theme.Label("Device network",19,true));
-        var explanation=Theme.Label("Both computers use the same OpenDesk service. A public server is needed for internet connections.\nConfigure the service once; normal connections use device numbers."); explanation.MaximumSize=new(555,0); panel.Controls.Add(explanation);
-        panel.Controls.Add(Theme.Label("HTTPS service address")); url.Text=settings.ServiceUrl; panel.Controls.Add(url);
-        panel.Controls.Add(Theme.Label("Service certificate fingerprint (for a self-hosted certificate)",9)); pin.Text=settings.ServicePin; panel.Controls.Add(pin);
-        panel.Controls.Add(Theme.Label("Your display name")); name.Text=settings.DisplayName; panel.Controls.Add(name);
+        Font=new Font("Segoe UI",10);BackColor=Color.White;var panel=Theme.Stack();
+        panel.Controls.Add(Theme.Label("Settings",20,true));
+        panel.Controls.Add(Theme.Description("Your identity and device network."));
+        panel.Controls.Add(Theme.Label("Your display name",11,true));name.Text=settings.DisplayName;name.AccessibleName="Your display name";panel.Controls.Add(name);
+        panel.Controls.Add(Theme.Label("Device network",12,true));
+        panel.Controls.Add(Theme.Description("Both computers must use the same service. Configure it once, then connect using device addresses."));
+        panel.Controls.Add(Theme.Label("HTTPS service address"));url.AccessibleName="HTTPS service address";url.Text=settings.ServiceUrl;panel.Controls.Add(url);
+        panel.Controls.Add(Theme.Label("Trusted certificate fingerprint",10));pin.AccessibleName="Trusted certificate fingerprint";pin.Text=settings.ServicePin;panel.Controls.Add(pin);
         var save=Theme.Button("Save settings",true); var local=Theme.Button("Start local service");
         save.Click+=(_,_)=>Save(); local.Click+=async(_,_)=>await StartLocalAsync(local);
         var stop=Theme.Button("Stop local service");stop.Click+=async(_,_)=>{try{string exe=Path.Combine(AppContext.BaseDirectory,"OpenDesk.Service.exe");using var process=System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe,"--stop"){UseShellExecute=false,CreateNoWindow=true,WindowStyle=System.Diagnostics.ProcessWindowStyle.Hidden});if(process is not null)await process.WaitForExitAsync();}catch(Exception ex){MessageBox.Show(this,ex.Message,"Local service");}};
-        panel.Controls.Add(Theme.Row(save,local,stop));
-        var hint=Theme.Label("For another PC, use this service machine's IP/hostname instead of localhost, and the same fingerprint.\nThe service uses HTTPS 47834 and relay TCP 47832 by default.",9); hint.MaximumSize=new(555,0); panel.Controls.Add(hint); Controls.Add(panel);
+        Theme.Destructive(stop);var cancel=Theme.Button("Cancel");cancel.DialogResult=DialogResult.Cancel;CancelButton=cancel;
+        panel.Controls.Add(Theme.Row(save,cancel));panel.Controls.Add(Theme.Label("Local service",11,true));panel.Controls.Add(Theme.Row(local,stop));
+        panel.Controls.Add(Theme.Description("On another PC, use this service machine's IP or hostname and the same fingerprint. HTTPS: 47834. Legacy relay: 47832."));Controls.Add(panel);ResumeLayout(true);
     }
     private void Save()
     {

@@ -13,10 +13,11 @@ namespace OpenDesk.Smoke;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2); Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
         Application.AddMessageFilter(new RemoteInputFilter());
+        if (args.Contains("--ui")) { UiChecks.Run(); return; }
         if (!RemoteInputFilter.Blocks(0x201, RemoteInputFilter.Marker) || RemoteInputFilter.Blocks(0x201, 0)) throw new Exception("Input filter mismatch");
         using var root = new Form { Opacity = 0, ShowInTaskbar = false };
         root.Shown += async (_, _) => {
@@ -42,7 +43,8 @@ internal static class Program
                 if (host.DeviceAddress == viewerHome.DeviceAddress) throw new Exception("Different devices received the same ID");
 
                 var input = (TextBox)viewerHome.Controls.Find("RemoteAddress", true).Single(); var button = (Button)viewerHome.Controls.Find("Connect", true).Single();
-                input.Text = DeviceProof.FormatId(host.DeviceAddress); button.PerformClick();
+                input.Text = DeviceProof.FormatId(host.DeviceAddress);
+                typeof(Control).GetMethod("OnKeyDown",System.Reflection.BindingFlags.Instance|System.Reflection.BindingFlags.NonPublic)!.Invoke(input,[new KeyEventArgs(Keys.Enter)]);
                 ApprovalForm? approval;
                 while ((approval = Application.OpenForms.OfType<ApprovalForm>().FirstOrDefault()) is null) await Task.Delay(10, timeout.Token);
                 var allow = Descendants(approval).OfType<Button>().Single(b => b.Text == "Allow control");

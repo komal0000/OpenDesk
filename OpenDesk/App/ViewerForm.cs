@@ -21,7 +21,7 @@ internal sealed class ViewerForm : Form
     private readonly Inbox inbox;
     private readonly Label state = Theme.Label("Connecting…", 10, true);
     private readonly CheckBox enableInput = new() { Text = "Send keyboard and mouse", AutoSize = true, Enabled = false, Margin = new Padding(12, 12, 12, 4) };
-    private readonly Button fileButton = Theme.Button("Send file"), clipboardButton = Theme.Button("Send clipboard"), recordButton = Theme.Button("Record"), statsButton = Theme.Button("Stats");
+    private readonly ToolStripButton fileButton = new("Send file"), clipboardButton = new("Send clipboard"), recordButton = new("Record"), statsButton = new("Stats");
     private TaskCompletionSource<string>? offer;
     private TaskCompletionSource<byte[]>? screenshot;
     private FileStream? recording;
@@ -36,8 +36,9 @@ internal sealed class ViewerForm : Form
 
     // locallyControlled: someone controls this PC right now. Their injected input could reach this window
     // (the WinForms input filter cannot see into WebView2), so input to the remote device pauses meanwhile.
-    internal ViewerForm(ClientSettings settings, string id, Func<bool> locallyControlled)
+    internal ViewerForm(ClientSettings settings, string id, Func<bool> locallyControlled, bool autoConnect = true)
     {
+        SuspendLayout();
         this.settings = settings; this.id = id; this.locallyControlled = locallyControlled;
         bridge = new(page);
         peer = new((channel, data, ct) => bridge.SendAsync(null, channel, data, ct));
@@ -48,11 +49,11 @@ internal sealed class ViewerForm : Form
         inbox = new(peer.ReceiveAsync, ex => Ui(() => Fail(ex is UnauthorizedAccessException ? ex.Message : "The host sent invalid data; the session was closed.")), stop.Token);
         AutoScaleDimensions = new(96, 96); AutoScaleMode = AutoScaleMode.Dpi; DoubleBuffered = true;
         Text = $"OpenDesk · {DeviceProof.FormatId(id)}"; ClientSize = new(1100, 760); MinimumSize = new(600, 400);
-        StartPosition = FormStartPosition.CenterScreen; KeyPreview = true; BackColor = Color.White;
-        var top = Theme.Row(state, enableInput); top.Padding = new Padding(12, 0, 0, 0);
+        StartPosition = FormStartPosition.CenterScreen; KeyPreview = true; BackColor = page.DefaultBackgroundColor;Font=new Font("Segoe UI",10);
+        var top = Theme.Row(state, enableInput);top.BackColor=Color.White;top.Dock=DockStyle.Top;top.Padding = new Padding(12, 0, 0, 0);
         state.MaximumSize = new(420, 0);
-        var disconnect = Theme.Button("Disconnect"); disconnect.Click += (_, _) => Close();
-        var chatButton = Theme.Button("Chat"); chatButton.Click += (_, _) => OpenChat();
+        var disconnect = new ToolStripButton("Disconnect"){ForeColor=Theme.Accent};disconnect.Click += (_, _) => Close();
+        var chatButton = new ToolStripButton("Chat");chatButton.Click += (_, _) => OpenChat();
         fileButton.Enabled = clipboardButton.Enabled = false;
         fileButton.Click += async (_, _) => {
             string? path = SessionFiles.PickSend(this); if (path is null) return;
@@ -67,19 +68,22 @@ internal sealed class ViewerForm : Form
                 await peer.SendMessageAsync(Wire.Json(MessageKind.Clipboard, text), stop.Token); state.Text = "Clipboard text sent";
             } catch (Exception ex) { state.Text = ex.Message; }
         };
-        var screenshotButton = Theme.Button("Screenshot"); screenshotButton.Click += async (_, _) => await SaveScreenshotAsync();
+        var screenshotButton = new ToolStripButton("Screenshot");screenshotButton.Click += async (_, _) => await SaveScreenshotAsync();
         recordButton.Click += (_, _) => ToggleRecording();
-        var fullscreen = Theme.Button("Fullscreen"); fullscreen.Click += (_, _) => ToggleFullscreen();
+        var fullscreen = new ToolStripButton("Fullscreen");fullscreen.Click += (_, _) => ToggleFullscreen();
         statsButton.Click += (_, _) => { overlay = !overlay; Post(new { t = "overlay", on = overlay }); };
-        top.Controls.AddRange([disconnect, chatButton, fileButton, clipboardButton, screenshotButton, recordButton, fullscreen, statsButton]);
-        foreach (var button in top.Controls.OfType<Button>()) { button.MinimumSize = new(75, 32); button.Padding = new(6, 2, 6, 2); button.Font = new Font("Segoe UI", 9); }
+        var toolbar=new ToolStrip {Name="SessionToolbar",Dock=DockStyle.Top,GripStyle=ToolStripGripStyle.Hidden,CanOverflow=true,AutoSize=false,Height=44,Padding=new Padding(8,4,8,4),BackColor=Theme.Sidebar,Renderer=new ToolStripSystemRenderer(),LayoutStyle=ToolStripLayoutStyle.HorizontalStackWithOverflow};
+        toolbar.Items.AddRange([chatButton,fileButton,clipboardButton,new ToolStripSeparator(),screenshotButton,recordButton,new ToolStripSeparator(),fullscreen,statsButton,new ToolStripSeparator(),disconnect]);
+        foreach(var button in toolbar.Items.OfType<ToolStripButton>()){button.Font=new Font("Segoe UI",9);button.Padding=new(8,4,8,4);button.DisplayStyle=ToolStripItemDisplayStyle.Text;button.Overflow=ToolStripItemOverflow.AsNeeded;}
         var hint = Theme.Label("Click the screen to focus. Ctrl+Alt+F12 releases remote input. Windows secure desktops are unavailable.", 9);
-        hint.Dock = DockStyle.Bottom; hint.Height = 30; hint.Padding = new(12, 0, 0, 0);
-        Controls.Add(page); Controls.Add(hint); Controls.Add(top);
+        hint.Dock=DockStyle.Bottom;hint.AutoSize=false;hint.Height=44;hint.Padding=new(12,4,12,4);hint.ForeColor=Theme.Muted;hint.BackColor=Color.White;
+        enableInput.AccessibleName="Send keyboard and mouse";
+        Controls.Add(page);Controls.Add(hint);Controls.Add(toolbar);Controls.Add(top);
         enableInput.CheckedChanged += (_, _) => PostStatus();
-        Shown += async (_, _) => await ConnectAsync();
+        Shown += async (_, _) => {if(autoConnect)await ConnectAsync();};
         FormClosing += (_, _) => { stop.Cancel(); inbox.Complete(); Post(new { t = "close" }); };
         FormClosed += async (_, _) => { StopRecording(); bridge.FailAll(); await files.DisposeAsync(); chat?.Close(); page.Dispose(); };
+        ResumeLayout(true);
     }
 
     private async Task ConnectAsync()

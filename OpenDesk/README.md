@@ -69,8 +69,10 @@ hotspot), direct or relayed, round trip, and how clicks and typing feel.
 
 ## Working features
 
-- Address-first red/white/gray interface with New Session, Recent Sessions,
-  Favorites, Address Book, Incoming Sessions and Settings.
+- Classic desktop layout with a prominent local address, recent-device cards,
+  selected navigation, and consistent approval, settings and chat windows.
+  **Display & sharing** expands capture settings; the viewer toolbar moves
+  extra actions into its overflow menu when the window is narrow.
 - Persistent numeric IDs, Windows-protected device keys, fresh ownership challenges,
   pinned service certificate. The viewer remembers each device's key and refuses a
   silent change (remove the contact to accept a reinstalled PC).
@@ -105,6 +107,20 @@ Choose **Fast** (1024 px), **Balanced** (1280 px) or **Sharp** (1600 px) on the 
 Video is sent only when the screen changes, up to 60 frames per second. If the host's
 display turns off or shows a secure desktop, viewers keep the last image; remote mouse
 input wakes the display and video resumes.
+
+## UI verification
+
+From this directory, run `dotnet run --project App.Smoke -c Release -- --ui`.
+It uses isolated fixture profiles, captures the existing screens at default and
+minimum sizes, and checks layout, contrast, navigation, permission defaults,
+keyboard handlers and protected toolbar overflow. Screenshots and `result.txt`
+are in `App.Smoke/bin/Release/net10.0-windows/ui-checks/`. The report records the
+actual display DPI; it does not claim coverage of unavailable DPI configurations.
+`OpenDesk.exe --ui-smoke` also captures an isolated home screen as `ui-smoke.png`
+beside the executable, without connecting to a service or loading your profile.
+
+Run the same smoke project without `--ui` for the real local-service session,
+approval, video and input check. It needs an active display and WebView2.
 
 ## How a session works
 
