@@ -14,7 +14,7 @@ public sealed class DirectoryHost : IAsyncDisposable
     public string Url => app.Urls.Single();
     public int RelayPort => relay.Port;
     private DirectoryHost(WebApplication app, PairingServer relay) { this.app = app; this.relay = relay; }
-    public static async Task<DirectoryHost> StartAsync(string registryPath, X509Certificate2 certificate, int servicePort = 47834, int relayPort = 47832, bool loopback = false)
+    public static async Task<DirectoryHost> StartAsync(string registryPath, X509Certificate2 certificate, int servicePort = 47834, int relayPort = 47832, bool loopback = false, TurnSettings? turn = null)
     {
         var relay = new PairingServer(); relay.Start(loopback ? IPAddress.Loopback : IPAddress.Any, relayPort);
         try {
@@ -23,6 +23,7 @@ public sealed class DirectoryHost : IAsyncDisposable
             builder.WebHost.ConfigureKestrel(server => {
                 server.Limits.MaxRequestBodySize = Wire.MaxControl; server.Limits.MaxConcurrentConnections = 128;
                 server.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(10);
+                server.Limits.MaxConcurrentUpgradedConnections = 1000; // v2 hosts keep one signaling socket open
                 server.Listen(loopback ? IPAddress.Loopback : IPAddress.Any, servicePort, endpoint => endpoint.UseHttps(certificate));
             });
             builder.Services.AddRateLimiter(options => {
@@ -31,6 +32,11 @@ public sealed class DirectoryHost : IAsyncDisposable
                     context.Connection.RemoteIpAddress?.ToString() ?? "local", _ => new FixedWindowRateLimiterOptions { PermitLimit=600, Window=TimeSpan.FromMinutes(1), QueueLimit=0 }));
             });
             var app = builder.Build(); app.UseRateLimiter();
+            app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(15), KeepAliveTimeout = TimeSpan.FromSeconds(30) });
+            var hub = new SignalingHub(registry, turn);
+            app.MapGet("/v2/info", () => Results.Json(new DirectoryClient.SignalingInfo(2, true)));
+            app.Map("/v2/host", context => context.WebSockets.IsWebSocketRequest ? hub.HostAsync(context) : BadRequest(context));
+            app.Map("/v2/connect/{id}", context => context.WebSockets.IsWebSocketRequest ? hub.ConnectAsync(context, context.Request.RouteValues["id"] as string ?? "") : BadRequest(context));
             app.MapGet("/v1/info", () => Results.Json(new OpenDesk.Core.DirectoryInfo(1,relay.Port)));
             app.MapPost("/v1/challenge", () => {
                 try { return Results.Json(new DirectoryClient.ChallengeReply(registry.Challenge(DateTimeOffset.UtcNow))); }
@@ -49,5 +55,6 @@ public sealed class DirectoryHost : IAsyncDisposable
             await app.StartAsync(); return new(app,relay);
         } catch { await relay.DisposeAsync(); throw; }
     }
+    private static Task BadRequest(HttpContext context) { context.Response.StatusCode = 400; return Task.CompletedTask; }
     public async ValueTask DisposeAsync() { await app.StopAsync(); await app.DisposeAsync(); await relay.DisposeAsync(); }
 }

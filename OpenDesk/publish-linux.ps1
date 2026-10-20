@@ -5,10 +5,11 @@ $output = Join-Path $PSScriptRoot "artifacts/service-$Runtime"
 if ($LASTEXITCODE -ne 0) { throw 'Linux service publish failed' }
 $binary = [IO.File]::ReadAllBytes((Join-Path $output 'OpenDesk.Service'))
 if ($binary.Length -lt 20 -or [BitConverter]::ToString($binary[0..3]) -ne '7F-45-4C-46') { throw 'Published service is not an ELF executable' }
-foreach ($file in @('opendesk-server.service','install.sh','README.md')) {
+$files = @('opendesk-server.service','install.sh','upgrade.sh','setup-turn.sh','turnserver.conf','README.md')
+foreach ($file in $files) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "deploy/linux/$file") -Destination (Join-Path $output $file)
 }
 $archive = Join-Path $PSScriptRoot "artifacts/OpenDesk-Service-$Runtime.tar.gz"
-& tar -czf $archive -C $output OpenDesk.Service opendesk-server.service install.sh README.md
+& tar -czf $archive -C $output OpenDesk.Service @files
 if ($LASTEXITCODE -ne 0) { throw 'Linux archive failed' }
 Write-Output "Linux service bundle: $archive"

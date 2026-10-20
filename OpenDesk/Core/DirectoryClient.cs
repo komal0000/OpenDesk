@@ -10,18 +10,36 @@ public sealed class DirectoryClient : IDisposable
     public Uri Endpoint { get; }
     public DirectoryClient(string url, string servicePin = "")
     {
+        Endpoint = ServiceRoot(url);
+        var handler = new HttpClientHandler { AllowAutoRedirect = false };
+        if (PinCheck(servicePin) is { } matches) handler.ServerCertificateCustomValidationCallback = (_, cert, _, _) => cert is not null && matches(cert.RawData);
+        http = new(handler) { BaseAddress = Endpoint, Timeout = TimeSpan.FromSeconds(10) };
+    }
+    public static Uri ServiceRoot(string url)
+    {
         if (!Uri.TryCreate(url.TrimEnd('/') + "/", UriKind.Absolute, out var uri) || uri.Scheme != "https" ||
             uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.Fragment.Length != 0 || uri.AbsolutePath != "/")
             throw new FormatException("Service address must be an HTTPS root address.");
-        Endpoint = uri;
-        if (servicePin.Length != 0 && !Invitation.IsHex(servicePin,64)) throw new FormatException("Service fingerprint must contain 64 hexadecimal characters.");
-        var handler = new HttpClientHandler { AllowAutoRedirect = false };
-        if (servicePin.Length != 0) {
-            byte[] expected = Convert.FromHexString(servicePin);
-            handler.ServerCertificateCustomValidationCallback = (_, cert, _, _) => cert is not null && CryptographicOperations.FixedTimeEquals(SHA256.HashData(cert.RawData), expected);
-        }
-        http = new(handler) { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(10) };
+        return uri;
     }
+    // Null means normal platform trust; otherwise the certificate must hash to the pinned fingerprint.
+    public static Func<byte[], bool>? PinCheck(string servicePin)
+    {
+        if (servicePin.Length == 0) return null;
+        if (!Invitation.IsHex(servicePin,64)) throw new FormatException("Service fingerprint must contain 64 hexadecimal characters.");
+        byte[] expected = Convert.FromHexString(servicePin);
+        return raw => CryptographicOperations.FixedTimeEquals(SHA256.HashData(raw), expected);
+    }
+    // False only when the service lacks v2 (an older version); other failures throw as usual.
+    public async Task<bool> SupportsSignalingAsync(CancellationToken ct)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct); deadline.CancelAfter(TimeSpan.FromSeconds(10));
+        using var result = await http.GetAsync("v2/info", deadline.Token);
+        if (result.StatusCode == System.Net.HttpStatusCode.NotFound) return false;
+        if (!result.IsSuccessStatusCode) throw new IOException($"Device service could not complete the request ({(int)result.StatusCode}).");
+        return true;
+    }
+    public sealed record SignalingInfo(int Protocol, bool Signaling);
     private async Task<T> RequestAsync<T>(HttpRequestMessage request, CancellationToken ct)
     {
         using var deadline=CancellationTokenSource.CreateLinkedTokenSource(ct);deadline.CancelAfter(TimeSpan.FromSeconds(10));ct=deadline.Token;

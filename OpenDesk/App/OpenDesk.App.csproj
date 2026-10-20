@@ -9,4 +9,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../Core/OpenDesk.Core.csproj" /></ItemGroup>
+  <ItemGroup><PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4191.47" /></ItemGroup>
+  <!-- The WebRTC pages ship inside the executable and are served at https://app.opendesk/. -->
+  <ItemGroup><EmbeddedResource Include="web/*" LogicalName="web/%(Filename)%(Extension)" /></ItemGroup>
 </Project>

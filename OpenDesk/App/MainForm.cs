@@ -23,18 +23,15 @@ internal sealed class MainForm : Form
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid,FileTransfer> transfers=[];
     private readonly Dictionary<Guid,ChatForm> chats=[];
     private readonly System.Collections.Concurrent.ConcurrentBag<Task> fileCleanup=[];
-    private DesktopSource? desktop;
     private readonly Screen[] screens=Screen.AllScreens;
-    private HostService? host;
-    private DirectoryClient? directory;
+    private HostEngine? host;
     private ECDsa? deviceKey;
-    private CancellationTokenSource? hosting,joining;
-    private Task? registration;
+    private CancellationTokenSource? hosting;
     private bool closing;
     private bool connectingHost;
     private readonly bool autoConnect;
     private string currentPage="home";
-    internal bool IsOnline=>host?.IsRunning==true&&settings.DeviceId.Length==9&&registration is not null;
+    internal bool IsOnline=>host?.IsConnected==true&&settings.DeviceId.Length==9;
     internal string DeviceAddress=>settings.DeviceId;
     internal Task GoOfflineAsync()=>StopAsync();
 
@@ -60,17 +57,17 @@ internal sealed class MainForm : Form
         Controls.Add(content); Controls.Add(side); Controls.Add(footer); Controls.Add(top);
         for(int i=0;i<screens.Length;i++) monitor.Items.Add($"Display {i+1} · {screens[i].Bounds.Width} × {screens[i].Bounds.Height}");
         monitor.SelectedIndex=Math.Max(0,Array.FindIndex(screens,s=>s.Primary));
-        quality.Items.AddRange(["Fast · 1024 px","Balanced · 1280 px","Sharp · 1600 px"]);quality.SelectedIndex=Math.Clamp(settings.VideoQuality,0,2);
+        quality.Items.AddRange([..new[]{"Fast","Balanced","Sharp"}.Zip(VideoPipeline.Profiles,(name,p)=>$"{name} · {p.Width} px")]);quality.SelectedIndex=Math.Clamp(settings.VideoQuality,0,VideoPipeline.Profiles.Length-1);
         monitor.SelectedIndexChanged+=(_,_)=>UpdateCapture();quality.SelectedIndexChanged+=(_,_)=>{settings.VideoQuality=quality.SelectedIndex;settings.Save();UpdateCapture();};
         viewers.Columns.Add("Connected viewer",340); viewers.Columns.Add("Permission",180);
-        connect.Click+=async(_,_)=>await ConnectAsync(); remote.KeyDown+=async(_,e)=> { if(e.KeyCode==Keys.Enter) { e.SuppressKeyPress=true; await ConnectAsync(); } };
+        connect.Click+=(_,_)=>Connect(); remote.KeyDown+=(_,e)=> { if(e.KeyCode==Keys.Enter) { e.SuppressKeyPress=true; Connect(); } };
         remote.Name="RemoteAddress";connect.Name="Connect";
         online.Click+=async(_,_)=>await GoOnlineAsync(); stopAll.Click+=async(_,_)=>await StopAsync(); stopAll.Enabled=false;
         deviceId.Text=settings.DeviceId.Length==9 ? DeviceProof.FormatId(settings.DeviceId) : "Not registered";
         ShowPage("home");
         Shown+=async(_,_)=> { if(this.autoConnect && settings.ServiceUrl.Length>0) await GoOnlineAsync(); };
         FormClosing+=async(_,e)=> {
-            if(closing) return; e.Cancel=true; closing=true; Enabled=false; joining?.Cancel();
+            if(closing) return; e.Cancel=true; closing=true; Enabled=false;
             foreach(var window in windows.ToArray()) window.Close(); await StopAsync(); Close();
         };
     }
@@ -108,7 +105,7 @@ internal sealed class MainForm : Form
             panel.Controls.Add(Theme.Row(grant,revoke,remove)); RefreshViewers();
             var chat=Theme.Button("Chat");chat.Click+=(_,_)=>{if(Selected()is Guid id)OpenChat(id);};
             var sendFile=Theme.Button("Send file");sendFile.Click+=async(_,_)=>{if(Selected()is not Guid id||host is null)return;try{if(!host.Coordinator.Status(id).Files)throw new IOException("File transfers were not allowed when this viewer connected.");string? file=SessionFiles.PickSend(this);if(file is not null)await Files(id).SendAsync(file,hosting!.Token);}catch(Exception ex){ShowError(ex.Message);}};
-            var clipboard=Theme.Button("Send clipboard");clipboard.Click+=async(_,_)=>{if(Selected()is not Guid id||host is null)return;try{if(Clipboard.ContainsText()){string text=Clipboard.GetText();if(text.Length>2000)throw new IOException("Clipboard text is limited to 2,000 characters.");await host.SendMessageAsync(id,Wire.Json(MessageKind.Clipboard,text),hosting!.Token);}}catch(Exception ex){ShowError(ex.Message);}};
+            var clipboard=Theme.Button("Send clipboard");clipboard.Click+=async(_,_)=>{if(Selected()is not Guid id||host is null)return;try{if(Clipboard.ContainsText()){string text=Clipboard.GetText();if(text.Length>2000)throw new IOException("Clipboard text is limited to 2,000 characters.");await host.Peers.SendMessageAsync(id,Wire.Json(MessageKind.Clipboard,text),hosting!.Token);}}catch(Exception ex){ShowError(ex.Message);}};
             panel.Controls.Add(Theme.Row(chat,sendFile,clipboard));
         }
         else {
@@ -120,11 +117,11 @@ internal sealed class MainForm : Form
             foreach(var c in settings.Contacts.Where(c=>!favorites||c.Favorite).OrderByDescending(c=>c.LastConnected)) {
                 var row=new ListViewItem(c.Name){Tag=c}; row.SubItems.AddRange([DeviceProof.FormatId(c.Id),c.Favorite?"★":"",c.LastConnected==default?"Never":c.LastConnected.ToLocalTime().ToString("g")]); list.Items.Add(row);
             }
-            list.DoubleClick+=async(_,_)=> { if(list.SelectedItems.Count==1 && list.SelectedItems[0].Tag is Contact c) { remote.Text=c.Id; await ConnectAsync(); } };
+            list.DoubleClick+=(_,_)=> { if(list.SelectedItems.Count==1 && list.SelectedItems[0].Tag is Contact c) { remote.Text=c.Id; Connect(); } };
             panel.Controls.Add(list); var favorite=Theme.Button("Toggle favorite"); var edit=Theme.Button("Rename"); var remove=Theme.Button("Remove");
             favorite.Click+=(_,_)=> { if(list.SelectedItems.Count==1 && list.SelectedItems[0].Tag is Contact c) { settings.Contacts.Remove(c); settings.Contacts.Insert(0,c with {Favorite=!c.Favorite}); settings.Save(); ShowPage(page); } };
             edit.Click+=(_,_)=> { if(list.SelectedItems.Count==1 && list.SelectedItems[0].Tag is Contact c) EditContact(c); };
-            remove.Click+=(_,_)=> { if(list.SelectedItems.Count==1 && list.SelectedItems[0].Tag is Contact c) { settings.Contacts.Remove(c);settings.Save();ShowPage(page); } };
+            remove.Click+=(_,_)=> { if(list.SelectedItems.Count==1 && list.SelectedItems[0].Tag is Contact c) { settings.Contacts.Remove(c);settings.KnownKeys.Remove(c.Id);settings.Save();ShowPage(page); } };
             panel.Controls.Add(Theme.Row(favorite,edit,remove));
         }
     }
@@ -133,7 +130,7 @@ internal sealed class MainForm : Form
         var tiles=Theme.Row(); int count=0;
         foreach(var c in contacts) {
             var tile=Theme.Button($"▣  {c.Name}\n{DeviceProof.FormatId(c.Id)}"); tile.AutoSize=false; tile.Size=new(235,86); tile.TextAlign=ContentAlignment.MiddleLeft;
-            tile.Click+=async(_,_)=> { remote.Text=c.Id; await ConnectAsync(); }; tiles.Controls.Add(tile); count++;
+            tile.Click+=(_,_)=> { remote.Text=c.Id; Connect(); }; tiles.Controls.Add(tile); count++;
         }
         if(count==0) tiles.Controls.Add(Theme.Label("Devices you connect to will appear here.",10)); return tiles;
     }
@@ -145,15 +142,15 @@ internal sealed class MainForm : Form
         save.Click+=(_,_)=> { try { string number=DeviceProof.NormalizeId(id.Text);if(string.IsNullOrWhiteSpace(name.Text))throw new FormatException("Enter a device name.");settings.Contacts.RemoveAll(c=>c.Id==number||c==existing);settings.Contacts.Insert(0,new(number,name.Text.Trim(),existing?.Favorite??false,existing?.LastConnected??default));settings.Save();dialog.DialogResult=DialogResult.OK; }catch(Exception ex){MessageBox.Show(dialog,ex.Message);} };
         if(dialog.ShowDialog(this)==DialogResult.OK)ShowPage("contacts");
     }
-    private (int Width,long Quality) CaptureProfile()=>quality.SelectedIndex switch{0=>(1024,50),2=>(1600,80),_=>(1280,65)};
-    private void UpdateCapture(){if(host is not null&&desktop is not null){var profile=CaptureProfile();host.Coordinator.ChangeDisplay(()=>desktop.Select(screens[monitor.SelectedIndex].Bounds,profile.Width,profile.Quality));}}
+    private VideoPipeline.Profile CaptureProfile()=>VideoPipeline.Profiles[quality.SelectedIndex];
+    private void UpdateCapture()=>host?.ChangeDisplay(screens[monitor.SelectedIndex].Bounds,CaptureProfile());
     private Guid? Selected()=>viewers.SelectedItems.Count==1 && viewers.SelectedItems[0].Tag is Guid id?id:null;
     private void Ui(Action action){if(!IsDisposed&&IsHandleCreated){try{BeginInvoke(action);}catch(InvalidOperationException){}}}
     private void RefreshViewers()
     {
         Guid? selected=Selected();viewers.BeginUpdate();viewers.Items.Clear();
-        foreach(var v in host?.Coordinator.Viewers??[]){var row=new ListViewItem(v.Name){Tag=v.Id,Selected=v.Id==selected};row.SubItems.Add(v.Control?"Keyboard + mouse":"View only");viewers.Items.Add(row);}viewers.EndUpdate();
-        if(host is not null)bottom.Text=host.IsRunning?$"Online · {viewers.Items.Count}/{host.Coordinator.Capacity} viewers · TLS encrypted":"Sharing stopped · go offline, then reconnect";
+        foreach(var v in host?.Coordinator.Viewers??[]){var row=new ListViewItem(v.Name){Tag=v.Id,Selected=v.Id==selected};row.SubItems.Add((v.Control?"Keyboard + mouse":"View only")+(host!.Route(v.Id) is {} route?" · "+route:""));viewers.Items.Add(row);}viewers.EndUpdate();
+        if(host is not null)bottom.Text=host.IsConnected?$"Online · {viewers.Items.Count}/{host.Coordinator.Capacity} viewers · end-to-end encrypted":"Reconnecting to the device network…";
     }
     private async Task GoOnlineAsync()
     {
@@ -162,32 +159,25 @@ internal sealed class MainForm : Form
         connectingHost=true;
         online.Enabled=false;network.Text="Connecting to device network…";
         try{
-            hosting=new();var token=hosting.Token;directory=new(settings.ServiceUrl,settings.ServicePin);var info=await directory.InfoAsync(token);token.ThrowIfCancellationRequested();
-            if(info.Protocol!=1 || info.RelayPort is <1 or >65535)throw new InvalidDataException("Unsupported device service.");
-            var loadedKey=await Task.Run(deviceKeyFactory);if(token.IsCancellationRequested){loadedKey.Dispose();return;}deviceKey=loadedKey;var screen=screens[monitor.SelectedIndex];var profile=CaptureProfile();desktop=new(screen.Bounds,profile.Width,profile.Quality);
-            var source=desktop;int capacity=(int)limit.Value;
-            var createdHost=await Task.Run(()=>new HostService(source,inputOverride??new WindowsInput(()=>source.Bounds),RequestApprovalAsync,capacity));
-            if(token.IsCancellationRequested){await createdHost.DisposeAsync();return;}host=createdHost;
-            host.MessageReceived=ReceiveMessageAsync;
-            host.PeerDisconnected+=id=>{if(transfers.TryRemove(id,out var file))fileCleanup.Add(file.DisposeAsync().AsTask());Ui(()=>{if(chats.TryGetValue(id,out var chat))chat.Append("System","Viewer disconnected");});};
-            host.Coordinator.Changed+=()=>Ui(RefreshViewers);host.Notice+=text=>Ui(()=>bottom.Text=text);
-            await host.StartRelayAsync(directory.Endpoint.Host,info.RelayPort,true);
-            var identity=await directory.RegisterAsync(deviceKey,host.Invitation,host.RelayOwner,hosting.Token);
-            settings.DeviceId=identity.Id;settings.Save();deviceId.Text=DeviceProof.FormatId(identity.Id);network.Text="● Online · ready for incoming connections";network.ForeColor=Color.FromArgb(34,139,84);
-            limit.Enabled=false;stopAll.Enabled=true;online.Text="Online";online.BackColor=Color.FromArgb(232,234,237);online.Cursor=Cursors.Default;registration=MaintainRegistrationAsync(hosting.Token);RefreshViewers();
+            hosting=new();var token=hosting.Token;
+            using(var directory=new DirectoryClient(settings.ServiceUrl,settings.ServicePin)){
+                if(!await directory.SupportsSignalingAsync(token))throw new InvalidDataException("This device service is too old for OpenDesk 0.4. Update the service (see deploy/linux/README.md).");
+            }
+            var loadedKey=await Task.Run(deviceKeyFactory);if(token.IsCancellationRequested){loadedKey.Dispose();return;}deviceKey=loadedKey;
+            host=new HostEngine(this,settings,deviceKey,inputOverride,RequestApprovalAsync,(int)limit.Value,screens[monitor.SelectedIndex].Bounds,CaptureProfile());
+            host.Peers.MessageReceived=ReceiveMessageAsync;
+            host.Peers.PeerDisconnected+=id=>{if(transfers.TryRemove(id,out var file))fileCleanup.Add(file.DisposeAsync().AsTask());Ui(()=>{if(chats.TryGetValue(id,out var chat))chat.Append("System","Viewer disconnected");});};
+            host.Coordinator.Changed+=()=>Ui(()=>{RefreshViewers();foreach(var window in windows)window.RefreshInput();});host.Notice+=text=>Ui(()=>bottom.Text=text);
+            host.ConnectionChanged+=connected=>Ui(()=>{network.Text=connected?"● Online · ready for incoming connections":"● Reconnecting to the device network…";network.ForeColor=connected?Color.FromArgb(34,139,84):Theme.Ink;RefreshViewers();});
+            string id=await host.StartAsync(token);
+            settings.DeviceId=id;settings.Save();deviceId.Text=DeviceProof.FormatId(id);
+            limit.Enabled=false;stopAll.Enabled=true;online.Text="Online";online.BackColor=Color.FromArgb(232,234,237);online.Cursor=Cursors.Default;RefreshViewers();
         }catch(Exception ex){await StopAsync();network.Text="Offline · service unavailable";ShowError(ex.Message);}finally{connectingHost=false;}
-    }
-    private async Task MaintainRegistrationAsync(CancellationToken ct)
-    {
-        try{using var timer=new PeriodicTimer(TimeSpan.FromSeconds(20));while(await timer.WaitForNextTickAsync(ct)){
-            if(host is null||!host.IsRunning)throw new IOException("Sharing connection ended.");
-            await directory!.RegisterAsync(deviceKey!,host.Invitation,host.RelayOwner,ct);
-        }}catch(Exception ex)when(ex is IOException or HttpRequestException or OperationCanceledException){if(!ct.IsCancellationRequested)Ui(async()=>{await StopAsync();network.Text="Offline · network connection ended";});}
     }
     private async Task StopAsync()
     {
-        hosting?.Cancel();if(registration is not null){try{await registration;}catch(OperationCanceledException){}}registration=null;
-        if(host is not null){await host.DisposeAsync();host=null;}desktop?.Dispose();desktop=null;foreach(var transfer in transfers.Values)await transfer.DisposeAsync();transfers.Clear();await Task.WhenAll(fileCleanup);fileCleanup.Clear();foreach(var chat in chats.Values)chat.Close();chats.Clear();directory?.Dispose();directory=null;deviceKey?.Dispose();deviceKey=null;hosting?.Dispose();hosting=null;
+        hosting?.Cancel();
+        if(host is not null){await host.DisposeAsync();host=null;}foreach(var transfer in transfers.Values)await transfer.DisposeAsync();transfers.Clear();await Task.WhenAll(fileCleanup);fileCleanup.Clear();foreach(var chat in chats.Values)chat.Close();chats.Clear();deviceKey?.Dispose();deviceKey=null;hosting?.Dispose();hosting=null;
         foreach(var request in requests.ToArray())request.Close();viewers.Items.Clear();online.Text="Go online";online.BackColor=Theme.Green;online.Cursor=Cursors.Hand;online.Enabled=true;stopAll.Enabled=false;monitor.Enabled=limit.Enabled=true;network.Text="● Offline · incoming connections are stopped";network.ForeColor=Theme.Ink;bottom.Text="Offline";
     }
     private void Configure()
@@ -195,18 +185,16 @@ internal sealed class MainForm : Form
         if(host is not null||connectingHost){ShowError("Stop incoming sessions before changing the device service.");return;}
         using var dialog=new ServiceSettingsForm(settings);if(dialog.ShowDialog(this)==DialogResult.OK){deviceId.Text=settings.DeviceId.Length==9?DeviceProof.FormatId(settings.DeviceId):"Not registered";_ = GoOnlineAsync();}
     }
-    private async Task ConnectAsync()
+    // The viewer window runs the connection and shows its progress and any failure.
+    private void Connect()
     {
-        if(joining is not null)return;
         if(settings.ServiceUrl.Length==0){Configure();return;}
-        connect.Enabled=false;joining=new();
-        try{
-            string id=DeviceProof.NormalizeId(remote.Text);using var lookup=new DirectoryClient(settings.ServiceUrl,settings.ServicePin);bottom.Text="Finding " + DeviceProof.FormatId(id) + "…";
-            var route=await lookup.LookupAsync(id,joining.Token);bottom.Text="Waiting for the remote host to approve…";
-            var session=await ViewerSession.ConnectAsync(route.Session,settings.DisplayName,joining.Token,true);
-            settings.Remember(id,DeviceProof.FormatId(id));if(currentPage=="home")ShowPage("home");var window=new ViewerForm(session,DeviceProof.FormatId(id)){Opacity=Opacity,ShowInTaskbar=ShowInTaskbar};windows.Add(window);window.FormClosed+=(_,_)=>{windows.Remove(window);window.Dispose();};window.Show();bottom.Text="Connected to " + DeviceProof.FormatId(id);
-        }catch(OperationCanceledException){bottom.Text="Connection cancelled or timed out";}catch(Exception ex){ShowError(ex.Message);bottom.Text="Connection ended";}
-        finally{joining.Dispose();joining=null;connect.Enabled=true;}
+        string id;
+        try{id=DeviceProof.NormalizeId(remote.Text);}catch(FormatException ex){ShowError(ex.Message);return;}
+        if(id==settings.DeviceId){ShowError("That is this computer's own address.");return;}
+        var window=new ViewerForm(settings,id,()=>host?.Coordinator.Viewers.Any(v=>v.Control)==true){Opacity=Opacity,ShowInTaskbar=ShowInTaskbar};windows.Add(window);
+        window.FormClosed+=(_,_)=>{windows.Remove(window);window.Dispose();if(currentPage=="home"&&!closing)ShowPage("home");};
+        window.Show();bottom.Text="Connecting to " + DeviceProof.FormatId(id) + "…";
     }
     private async Task<Approval> RequestApprovalAsync(string name,CancellationToken ct)
     {
@@ -217,13 +205,13 @@ internal sealed class MainForm : Form
     }
     private void Preview()
     {
-        try{var profile=CaptureProfile();using var capture=new ScreenCapture(screens[monitor.SelectedIndex].Bounds,profile.Width,profile.Quality);var f=capture.Frame();using var buffer=new MemoryStream(f.Jpeg);using var decoded=Image.FromStream(buffer);var image=new Bitmap(decoded);var window=new Form{Text="OpenDesk · Display preview",ClientSize=new(800,500)};window.Controls.Add(new PictureBox{Dock=DockStyle.Fill,SizeMode=PictureBoxSizeMode.Zoom,Image=image});window.FormClosed+=(_,_)=>{image.Dispose();window.Dispose();};window.Show(this);}catch(Exception ex){ShowError(ex.Message);}
+        try{var bounds=screens[monitor.SelectedIndex].Bounds;var image=new Bitmap(bounds.Width,bounds.Height);using(var g=Graphics.FromImage(image))g.CopyFromScreen(bounds.Location,Point.Empty,bounds.Size);var window=new Form{Text="OpenDesk · Display preview",ClientSize=new(800,500)};window.Controls.Add(new PictureBox{Dock=DockStyle.Fill,SizeMode=PictureBoxSizeMode.Zoom,Image=image});window.FormClosed+=(_,_)=>{image.Dispose();window.Dispose();};window.Show(this);}catch(Exception ex){ShowError(ex.Message);}
     }
-    private FileTransfer Files(Guid id)=>transfers.GetOrAdd(id,_=>{var files=new FileTransfer((message,ct)=>host!.SendMessageAsync(id,message,ct),(offer,ct)=>SessionFiles.ChooseSaveAsync(this,offer,ct));files.Notice+=text=>Ui(()=>bottom.Text=text);return files;});
+    private FileTransfer Files(Guid id)=>transfers.GetOrAdd(id,_=>{var files=new FileTransfer((message,ct)=>host!.Peers.SendMessageAsync(id,message,ct),(offer,ct)=>SessionFiles.ChooseSaveAsync(this,offer,ct));files.Notice+=text=>Ui(()=>bottom.Text=text);return files;});
     private void OpenChat(Guid id)
     {
         if(host is null)return;
-        if(!chats.TryGetValue(id,out var chat)||chat.IsDisposed){chat=new ChatForm(host.Coordinator.Viewers.FirstOrDefault(v=>v.Id==id)?.Name??"Viewer",text=>host.SendMessageAsync(id,Wire.Json(MessageKind.Chat,text),hosting!.Token));chats[id]=chat;}
+        if(!chats.TryGetValue(id,out var chat)||chat.IsDisposed){chat=new ChatForm(host.Coordinator.Viewers.FirstOrDefault(v=>v.Id==id)?.Name??"Viewer",text=>host.Peers.SendMessageAsync(id,Wire.Json(MessageKind.Chat,text),hosting!.Token));chats[id]=chat;}
         if(!chat.Visible)chat.Show(this);else chat.Activate();
     }
     private async Task ReceiveMessageAsync(Guid id,OpenDesk.Core.Message message,CancellationToken ct)

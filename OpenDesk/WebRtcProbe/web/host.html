@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8"><title>Probe host</title>
+<body style="margin:0;font:12px sans-serif">host
+<script src="common.js"></script>
+<script>
+const query = new URLSearchParams(location.search);
+const codec = 'video/' + (query.get('codec') || 'H264'), fps = Number(query.get('fps') || 60);
+
+chrome.webview.addEventListener('message', async e => {
+  const m = e.data;
+  if (m.type === 'signal') { if (m.desc) await pc.setRemoteDescription(m.desc); if (m.candidate) await pc.addIceCandidate(m.candidate); }
+  else if (m.type === 'stats') {
+    const stats = await videoStats('outbound-rtp');
+    stats.avgEncodeMs = 1000 * stats.totalEncodeTime / stats.framesEncoded;
+    (await pc.getStats()).forEach(s => { if (s.type === 'media-source' && s.kind === 'video') stats.sourceFps = s.framesPerSecond; });
+    post({ type: 'hostStats', stats });
+  }
+});
+
+async function start() {
+  const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: fps, max: fps } }, audio: false });
+  const track = stream.getVideoTracks()[0];
+  track.contentHint = 'motion';
+  // getDisplayMedia rejects `min`, but the track itself accepts it.
+  const minFps = await track.applyConstraints({ frameRate: { min: fps, ideal: fps, max: fps } }).then(() => 'applied', e => e.name + ': ' + e.message);
+  pc = new RTCPeerConnection();
+  pc.onicecandidate = e => e.candidate && post({ type: 'signal', candidate: e.candidate.toJSON() });
+  const dc = pc.createDataChannel('input');
+  dc.onmessage = e => { const m = JSON.parse(e.data); dc.send(JSON.stringify({ ack: m.seq })); if (m.click) post({ type: 'click', seq: m.seq }); };
+  const transceiver = pc.addTransceiver(track, { direction: 'sendonly', streams: [stream] });
+  const codecs = RTCRtpSender.getCapabilities('video').codecs;
+  if (!codecs.some(c => c.mimeType === codec)) throw new Error(codec + ' is not available');
+  transceiver.setCodecPreferences([...codecs.filter(c => c.mimeType === codec), ...codecs.filter(c => c.mimeType !== codec)]);
+  const parameters = transceiver.sender.getParameters();
+  parameters.degradationPreference = 'maintain-framerate';
+  for (const encoding of parameters.encodings) { encoding.maxFramerate = 60; encoding.maxBitrate = 12_000_000; }
+  await transceiver.sender.setParameters(parameters).catch(() => {});
+  await pc.setLocalDescription();
+  post({ type: 'signal', desc: pc.localDescription.toJSON() });
+  post({ type: 'capturing', settings: track.getSettings(), label: track.label, minFps });
+}
+post({ type: 'ready' });
+</script>

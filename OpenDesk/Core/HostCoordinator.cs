@@ -8,7 +8,7 @@ public sealed class HostCoordinator(IInputSink input, int capacity = 5)
     private readonly Dictionary<Guid, string> viewers = [];
     private readonly Dictionary<Guid,(bool Clipboard,bool Files)> permissions = [];
     private Guid? controller;
-    private long epoch;
+    private long epoch, display;
     public IReadOnlyList<ViewerInfo> Viewers { get { lock (gate) return viewers.Select(p => new ViewerInfo(p.Key, p.Value, p.Key == controller)).ToArray(); } }
     public Guid Add(string name, bool control = false, bool clipboard = false, bool files = false)
     {
@@ -21,7 +21,7 @@ public sealed class HostCoordinator(IInputSink input, int capacity = 5)
         }
         Changed?.Invoke(); return id;
     }
-    public SessionStatus Status(Guid id) { lock (gate) { permissions.TryGetValue(id,out var p);return new(controller == id && viewers.ContainsKey(id), epoch, "Connected",p.Clipboard,p.Files); } }
+    public SessionStatus Status(Guid id) { lock (gate) { permissions.TryGetValue(id,out var p);return new(controller == id && viewers.ContainsKey(id), epoch, "Connected",p.Clipboard,p.Files,Display:display); } }
     private void ChangeController(Guid? id)
     {
         if (id.HasValue && !viewers.ContainsKey(id.Value)) throw new InvalidOperationException("Viewer disconnected.");
@@ -51,5 +51,7 @@ public sealed class HostCoordinator(IInputSink input, int capacity = 5)
         lock (gate) { ChangeController(null); viewers.Clear(); permissions.Clear(); }
         Changed?.Invoke();
     }
-    public void ChangeDisplay(Action update){lock(gate){input.ReleaseAll();update();epoch++;}Changed?.Invoke();}
+    public void ChangeDisplay(Action update)=>ChangeDisplay(_=>update());
+    // `update` receives the new display generation, for stamping the video it produces.
+    public void ChangeDisplay(Action<long> update){lock(gate){input.ReleaseAll();display++;update(display);epoch++;}Changed?.Invoke();}
 }

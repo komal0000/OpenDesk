@@ -155,7 +155,7 @@ public sealed partial class HostService : IAsyncDisposable
                     }
                     else if(message.Kind is MessageKind.Chat or MessageKind.Clipboard or MessageKind.FileOffer or MessageKind.FileChunk or MessageKind.FileFinish or MessageKind.FileAck) {
                         var permission=Coordinator.Status(id);
-                        if(message.Kind==MessageKind.Clipboard&&!permission.Clipboard || message.Kind is >=MessageKind.FileOffer and <=MessageKind.FileAck && !permission.Files)throw new InvalidDataException("This capability was not approved.");
+                        if(!permission.Allows(message.Kind))throw new InvalidDataException("This capability was not approved.");
                         if(MessageReceived is not null)await MessageReceived(id,message,peerStop.Token);
                     }
                     else if (message.Kind != MessageKind.Ping) throw new InvalidDataException("Unexpected viewer message.");
@@ -222,7 +222,7 @@ public sealed partial class HostService : IAsyncDisposable
     {
         if(!peers.TryGetValue(id,out var peer))throw new IOException("Viewer disconnected.");
         var permission=Coordinator.Status(id);
-        if(message.Kind==MessageKind.Clipboard&&!permission.Clipboard || message.Kind is >=MessageKind.FileOffer and <=MessageKind.FileAck && !permission.Files)throw new UnauthorizedAccessException("The host did not grant this capability.");
+        if(!permission.Allows(message.Kind))throw new UnauthorizedAccessException("The host did not grant this capability.");
         using var wait=CancellationTokenSource.CreateLinkedTokenSource(ct,stop.Token,peer.Cancel.Token);wait.CancelAfter(TimeSpan.FromSeconds(5));
         await peer.Reliable.Writer.WriteAsync(message,wait.Token);peer.Wake.Writer.TryWrite(1);
     }

@@ -1,172 +1,222 @@
-using System.Threading.Channels;
+using System.Text.Json;
+using Microsoft.Web.WebView2.WinForms;
 using OpenDesk.Core;
 
 namespace OpenDesk.App;
 
+// One v2 session to a remote device. This form runs signaling and checks the host's signed answer,
+// then the viewer page carries video and input over WebRTC; the form handles status, chat, clipboard,
+// files, screenshots and recording.
 internal sealed class ViewerForm : Form
 {
-    private readonly ViewerSession session;
-    private readonly CancellationTokenSource stop = new();
-    private readonly RemoteScreen picture = new() { Dock = DockStyle.Fill, BackColor = Theme.Ink };
-    private readonly Label state = Theme.Label("Connected · View only", 10, true);
-    private readonly CheckBox enableInput = new() { Text = "Send keyboard and mouse", AutoSize = true, Enabled = false, Margin = new Padding(12,12,12,4) };
-    private readonly InputQueue inputs = new();
-    private int displayPosted;
-    private long lastMove;
-    private MouseButtons heldButtons;
-    private Task? reading, sending;
-    private ChatForm? chat;
+    private const long MaxRecording = 1_500_000_000;
+    private readonly ClientSettings settings;
+    private readonly string id;
+    private readonly Func<bool> locallyControlled;
+    private readonly WebView2 page = new() { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(31, 32, 35) };
+    private readonly ChannelBridge bridge;
+    private readonly PeerViewer peer;
     private readonly FileTransfer files;
-    private MjpegRecording? recorder;
-    private readonly object recordingGate=new();
-    private System.Threading.Timer? recordingTimer;
-    private long appliedEpoch=-1;
-    private readonly Button fileButton=Theme.Button("Send file"),clipboardButton=Theme.Button("Send clipboard"),recordButton=Theme.Button("Record");
-    private bool fullScreen;
+    private readonly CancellationTokenSource stop = new();
+    private readonly Inbox inbox;
+    private readonly Label state = Theme.Label("Connecting…", 10, true);
+    private readonly CheckBox enableInput = new() { Text = "Send keyboard and mouse", AutoSize = true, Enabled = false, Margin = new Padding(12, 12, 12, 4) };
+    private readonly Button fileButton = Theme.Button("Send file"), clipboardButton = Theme.Button("Send clipboard"), recordButton = Theme.Button("Record"), statsButton = Theme.Button("Stats");
+    private TaskCompletionSource<string>? offer;
+    private TaskCompletionSource<byte[]>? screenshot;
+    private FileStream? recording;
+    private ChatForm? chat;
+    private bool connected, hadControl, fullScreen, overlay;
+    private string route = "";
     private FormWindowState previousState;
     private Rectangle previousBounds;
     internal int RenderedFrames { get; private set; }
-    internal bool InputEnabled=>enableInput.Checked&&session.Status.Control;
-    internal double LastDecodeMilliseconds {get;private set;}
-    internal RemoteScreen ScreenSurface=>picture;
+    internal bool InputEnabled => enableInput.Checked && peer.Status.Control;
+    internal WebView2 Page => page;
 
-    internal ViewerForm(ViewerSession session, string address)
+    // locallyControlled: someone controls this PC right now. Their injected input could reach this window
+    // (the WinForms input filter cannot see into WebView2), so input to the remote device pauses meanwhile.
+    internal ViewerForm(ClientSettings settings, string id, Func<bool> locallyControlled)
     {
-        this.session = session;AutoScaleDimensions=new(96,96);AutoScaleMode=AutoScaleMode.Dpi;DoubleBuffered=true; Text = $"OpenDesk · {address}"; ClientSize = new(1100, 760); MinimumSize = new(600, 400);
+        this.settings = settings; this.id = id; this.locallyControlled = locallyControlled;
+        bridge = new(page);
+        peer = new((channel, data, ct) => bridge.SendAsync(null, channel, data, ct));
+        files = new FileTransfer(peer.SendMessageAsync, (fileOffer, ct) => SessionFiles.ChooseSaveAsync(this, fileOffer, ct));
+        files.Notice += text => Ui(() => state.Text = text);
+        peer.MessageReceived = ReceiveMessageAsync;
+        peer.StatusChanged += status => Ui(() => ApplyStatus(status));
+        inbox = new(peer.ReceiveAsync, ex => Ui(() => Fail(ex is UnauthorizedAccessException ? ex.Message : "The host sent invalid data; the session was closed.")), stop.Token);
+        AutoScaleDimensions = new(96, 96); AutoScaleMode = AutoScaleMode.Dpi; DoubleBuffered = true;
+        Text = $"OpenDesk · {DeviceProof.FormatId(id)}"; ClientSize = new(1100, 760); MinimumSize = new(600, 400);
         StartPosition = FormStartPosition.CenterScreen; KeyPreview = true; BackColor = Color.White;
-        var top = Theme.Row(state, enableInput); top.Padding = new Padding(12,0,0,0);
-        state.MaximumSize=new(360,0);enableInput.Enabled=session.Status.Control;enableInput.Checked=session.Status.Control;
-        var disconnect = Theme.Button("Disconnect"); disconnect.Click += (_, _) => Close(); top.Controls.Add(disconnect);
-        files=new FileTransfer((message,ct)=>session.SendMessageAsync(message,ct),(offer,ct)=>SessionFiles.ChooseSaveAsync(this,offer,ct));
-        files.Notice+=text=>Ui(()=>state.Text=text);
-        var chatButton=Theme.Button("Chat");chatButton.Click+=(_,_)=>OpenChat();
-        fileButton.Enabled=session.Status.Files;fileButton.Click+=async(_,_)=>{string? path=SessionFiles.PickSend(this);if(path is null)return;fileButton.Enabled=false;try{await files.SendAsync(path,stop.Token);}catch(Exception ex){Ui(()=>state.Text=ex.Message);}finally{fileButton.Enabled=session.Status.Files;}};
-        clipboardButton.Enabled=session.Status.Clipboard;clipboardButton.Click+=async(_,_)=>{try{if(Clipboard.ContainsText()){string text=Clipboard.GetText();if(text.Length>2000)throw new IOException("Clipboard text is limited to 2,000 characters.");await session.SendMessageAsync(Wire.Json(MessageKind.Clipboard,text),stop.Token);state.Text="Clipboard text sent";}}catch(Exception ex){state.Text=ex.Message;}};
-        var screenshot=Theme.Button("Screenshot");screenshot.Click+=(_,_)=>SaveScreenshot();recordButton.Click+=(_,_)=>ToggleRecording();
-        var fullscreen=Theme.Button("Fullscreen");fullscreen.Click+=(_,_)=>ToggleFullscreen();
-        top.Controls.AddRange([chatButton,fileButton,clipboardButton,screenshot,recordButton,fullscreen]);
-        foreach(var button in top.Controls.OfType<Button>()){button.MinimumSize=new(75,32);button.Padding=new(6,2,6,2);button.Font=new Font("Segoe UI",9);}
-        session.MessageReceived=ReceiveMessageAsync;
-        var hint = Theme.Label("Click the screen to focus. Ctrl+Alt+F12 releases remote input. Windows secure desktops are unavailable.", 9);
-        hint.Dock = DockStyle.Bottom; hint.Height = 30; hint.Padding = new(12,0,0,0);
-        Controls.Add(picture); Controls.Add(hint); Controls.Add(top);
-        enableInput.CheckedChanged += (_, _) => { if (!enableInput.Checked) Queue(new("reset")); };
-        picture.MouseDown += (_, e) => { picture.Focus();if(!InputEnabled){state.Text=session.Status.Control?"Input paused · enable Send keyboard and mouse":"View only · ask the host to allow control";return;}heldButtons |= e.Button; picture.Capture = true; Pointer(e, "button", true); };
-        picture.MouseUp += (_, e) => { Pointer(e, "button", false); heldButtons &= ~e.Button; picture.Capture = heldButtons != MouseButtons.None; };
-        picture.MouseMove += (_, e) => { long now = Environment.TickCount64; if (now - lastMove >= 16) { lastMove = now; Pointer(e, "move"); } };
-        picture.MouseWheel += (_, e) => Pointer(e, "wheel");
-        picture.LostFocus += (_, _) => Queue(new("reset"));
-        picture.MouseCaptureChanged += (_, _) => { if (!picture.Capture && heldButtons != MouseButtons.None) { heldButtons = MouseButtons.None; Queue(new("reset")); } };
-        Deactivate += (_, _) => Queue(new("reset"));
-        Shown += (_, _) => { reading = Task.Run(ReadAsync); sending = Task.Run(SendAsync); };
-        FormClosing += (_, _) => { stop.Cancel(); inputs.Complete(); };
-        FormClosed += async (_, _) => {
-            await session.DisposeAsync();
-            if (reading is not null) { try { await reading; } catch (Exception) { } }
-            if (sending is not null) { try { await sending; } catch (Exception) { } }
-            StopRecording();await files.DisposeAsync();chat?.Close();
+        var top = Theme.Row(state, enableInput); top.Padding = new Padding(12, 0, 0, 0);
+        state.MaximumSize = new(420, 0);
+        var disconnect = Theme.Button("Disconnect"); disconnect.Click += (_, _) => Close();
+        var chatButton = Theme.Button("Chat"); chatButton.Click += (_, _) => OpenChat();
+        fileButton.Enabled = clipboardButton.Enabled = false;
+        fileButton.Click += async (_, _) => {
+            string? path = SessionFiles.PickSend(this); if (path is null) return;
+            fileButton.Enabled = false;
+            try { await files.SendAsync(path, stop.Token); } catch (Exception ex) { state.Text = ex.Message; } finally { fileButton.Enabled = peer.Status.Files; }
         };
+        clipboardButton.Click += async (_, _) => {
+            try {
+                if (!Clipboard.ContainsText()) return;
+                string text = Clipboard.GetText();
+                if (text.Length > 2000) throw new IOException("Clipboard text is limited to 2,000 characters.");
+                await peer.SendMessageAsync(Wire.Json(MessageKind.Clipboard, text), stop.Token); state.Text = "Clipboard text sent";
+            } catch (Exception ex) { state.Text = ex.Message; }
+        };
+        var screenshotButton = Theme.Button("Screenshot"); screenshotButton.Click += async (_, _) => await SaveScreenshotAsync();
+        recordButton.Click += (_, _) => ToggleRecording();
+        var fullscreen = Theme.Button("Fullscreen"); fullscreen.Click += (_, _) => ToggleFullscreen();
+        statsButton.Click += (_, _) => { overlay = !overlay; Post(new { t = "overlay", on = overlay }); };
+        top.Controls.AddRange([disconnect, chatButton, fileButton, clipboardButton, screenshotButton, recordButton, fullscreen, statsButton]);
+        foreach (var button in top.Controls.OfType<Button>()) { button.MinimumSize = new(75, 32); button.Padding = new(6, 2, 6, 2); button.Font = new Font("Segoe UI", 9); }
+        var hint = Theme.Label("Click the screen to focus. Ctrl+Alt+F12 releases remote input. Windows secure desktops are unavailable.", 9);
+        hint.Dock = DockStyle.Bottom; hint.Height = 30; hint.Padding = new(12, 0, 0, 0);
+        Controls.Add(page); Controls.Add(hint); Controls.Add(top);
+        enableInput.CheckedChanged += (_, _) => PostStatus();
+        Shown += async (_, _) => await ConnectAsync();
+        FormClosing += (_, _) => { stop.Cancel(); inbox.Complete(); Post(new { t = "close" }); };
+        FormClosed += async (_, _) => { StopRecording(); bridge.FailAll(); await files.DisposeAsync(); chat?.Close(); page.Dispose(); };
     }
-    protected override bool ProcessCmdKey(ref System.Windows.Forms.Message msg, Keys keyData)
+
+    private async Task ConnectAsync()
     {
-        if (keyData == (Keys.Control | Keys.Alt | Keys.F12)) { enableInput.Checked = false; Queue(new("reset")); return true; }
-        if(keyData==Keys.Escape&&fullScreen&&!enableInput.Checked){ToggleFullscreen();return true;}
-        if (picture.Focused && enableInput.Checked && session.Status.Control && msg.Msg is 0x100 or 0x104) {
-            Queue(new("key", Code:(int)(keyData & Keys.KeyCode), Down:true)); return true;
-        }
-        return base.ProcessCmdKey(ref msg, keyData);
-    }
-    protected override void OnKeyDown(KeyEventArgs e)
-    {
-        if (picture.Focused && enableInput.Checked && session.Status.Control) { Queue(new("key", Code:e.KeyValue, Down:true)); e.Handled = e.SuppressKeyPress = true; }
-        base.OnKeyDown(e);
-    }
-    protected override void OnKeyUp(KeyEventArgs e)
-    {
-        if (picture.Focused && enableInput.Checked && session.Status.Control) { Queue(new("key", Code:e.KeyValue, Down:false)); e.Handled = e.SuppressKeyPress = true; }
-        base.OnKeyUp(e);
-    }
-    private void Pointer(MouseEventArgs e, string kind, bool down = false)
-    {
-        if (!enableInput.Checked || !session.Status.Control) return;
-        var image = picture.ImageSize;var point = ViewerCoordinates.Normalize(e.X, e.Y, picture.Width, picture.Height, image.Width, image.Height);
-        if (point is null) { if (kind == "button" && !down) Queue(new("reset")); return; }
-        int button = e.Button switch { MouseButtons.Left => 1, MouseButtons.Right => 2, MouseButtons.Middle => 3, _ => 0 };
-        Queue(new(kind, point.Value.X, point.Value.Y, button, down, Delta:e.Delta));
-    }
-    private void Queue(InputEvent value)
-    {
-        if (stop.IsCancellationRequested || !session.Status.Control || (value.Kind!="reset"&&Volatile.Read(ref appliedEpoch)!=session.Status.Epoch)) return;
-        if (!inputs.Post(value with { Epoch = session.Status.Epoch })) {
-            enableInput.Checked = false; stop.Cancel(); Close();
-        }
-    }
-    private async Task SendAsync()
-    {
-        try { await foreach (var input in inputs.ReadAllAsync(stop.Token)) await session.SendInputAsync(input, stop.Token); }
-        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException) { stop.Cancel(); Ui(() => { state.Text = "Input connection ended"; enableInput.Checked = false; }); }
-    }
-    private async Task ReadAsync()
-    {
-        bool hadControl=session.Status.Control;
-        try { await session.RunAsync(frame=>Present(()=>picture.Apply(frame),frame.Epoch), status => Ui(() => {
-            state.Text = status.Control ? "Connected · You have control" : "Connected · View only";
-            enableInput.Enabled = status.Control;if(status.Control&&!hadControl)enableInput.Checked=true;if(!status.Control)enableInput.Checked=false;hadControl=status.Control;
-            fileButton.Enabled=status.Files;clipboardButton.Enabled=status.Clipboard;
-        }), stop.Token, update=>Present(()=>picture.Apply(update),update.Epoch)); }
-        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException or InvalidDataException) {
-            Ui(() => { state.Text = "Disconnected · Close this window to reconnect"; enableInput.Enabled = enableInput.Checked = false; });
-        }
-        finally { stop.Cancel(); await session.DisposeAsync(); }
-    }
-    private void Ui(Action action) { if (!IsDisposed && IsHandleCreated) { try { BeginInvoke(action); } catch (InvalidOperationException) { } } }
-    // Reader thread: decode and paste into the surface, then let the UI repaint only what changed.
-    private void Present(Action apply,long epoch)
-    {
-        if(stop.IsCancellationRequested)return;
-        var watch=System.Diagnostics.Stopwatch.StartNew();
         try {
-            apply();LastDecodeMilliseconds=watch.Elapsed.TotalMilliseconds;
-            Volatile.Write(ref appliedEpoch,epoch);ScheduleDisplay();
-        } catch (Exception ex) when (ex is ArgumentException or InvalidDataException or OutOfMemoryException) {
-            stop.Cancel();Ui(()=>state.Text = "Invalid screen frame · disconnected");
+            if (!Signal.ValidName(settings.DisplayName)) throw new FormatException("Set a display name of 1–64 characters in Settings.");
+            state.Text = $"Finding {DeviceProof.FormatId(id)}…";
+            var opening = WebEngine.OpenAsync(page, "viewer.html", OnPage);
+            await using var signaling = await SignalingClient.ConnectAsync(settings.ServiceUrl, settings.ServicePin, "v2/connect/" + id, stop.Token);
+            var ready = await signaling.ReceiveAsync(TimeSpan.FromSeconds(15), stop.Token);
+            if (ready is not { Type: "ready", Session: { } session, PublicKey: { } publicKey }) throw new IOException("Unexpected device service response.");
+            // Trust on first use: the device key saved for this address must not change silently.
+            string keyPin = SignalProof.Fingerprint(publicKey);
+            if (settings.KnownKeys.TryGetValue(id, out var known) && known != keyPin)
+                throw new UnauthorizedAccessException("This address now belongs to a different device key. If that computer was reinstalled, remove it from your address book and connect again. Otherwise, do not continue.");
+            await opening;
+            offer = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            Post(new { t = "start", ice = ready.Ice ?? [] });
+            string sdp = await offer.Task.WaitAsync(TimeSpan.FromSeconds(15), stop.Token);
+            await signaling.SendAsync(new("offer", Name: settings.DisplayName.Trim(), Sdp: sdp), stop.Token);
+            Show("Waiting for the remote host to approve…");
+            var reply = await signaling.ReceiveAsync(TimeSpan.FromSeconds(95), stop.Token);
+            if (reply.Type == "reject") throw new UnauthorizedAccessException(reply.Reason ?? "The host declined the request.");
+            // The signature binds both descriptions, and so both encryption fingerprints, to the host's device key.
+            if (reply is not { Type: "answer", Sdp: { } answer } || !SignalProof.Verify(publicKey, SignalProof.Answer(id, session, sdp, answer), reply.Signature))
+                throw new UnauthorizedAccessException("The device's answer was not signed by its key, so the connection was stopped.");
+            Post(new { t = "answer", sdp = answer });
+            Show("Approved · connecting…");
+            var status = await peer.Accepted.WaitAsync(TimeSpan.FromSeconds(30), stop.Token);
+            connected = true;
+            settings.Remember(id, DeviceProof.FormatId(id), keyPin);
+            ApplyStatus(status);
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+        // The window's only job here is to say why the session did not start.
+        catch (Exception ex) {
+            Fail(ex is TimeoutException ? "The connection timed out. Both devices must be online; on different networks the device service needs TURN." : ex.Message);
         }
     }
-    private void ScheduleDisplay(){if(Interlocked.Exchange(ref displayPosted,1)==0)Ui(DisplayFrame);}
-    private void DisplayFrame(){
-        Interlocked.Exchange(ref displayPosted,0);
-        picture.InvalidateChanges();RenderedFrames++;
-    }
-    // Tile updates arrive only when something changes, so record from the surface at a steady rate.
-    private void RecordFrame()
+
+    // Messages from the viewer page (UI thread).
+    private void OnPage(JsonElement m)
     {
-        lock(recordingGate){
-            if(recorder is null)return;
-            try{if(picture.EncodeFrame() is {} frame)recorder.Add(frame);}
-            catch(Exception ex)when(ex is IOException or InvalidOperationException or ArgumentException or ObjectDisposedException){StopRecording();Ui(()=>state.Text="Recording stopped: "+ex.Message);}
+        if (bridge.TryAcknowledge(m)) return;
+        switch (m.GetProperty("t").GetString()) {
+            case "offer": offer?.TrySetResult(m.GetProperty("sdp").GetString() ?? ""); break;
+            case "recv": if (!inbox.Post(m)) Fail("The host sent data too fast; the session was closed."); break;
+            case "frame": RenderedFrames++; break;
+            case "state":
+                string connection = m.GetProperty("state").GetString() ?? "";
+                if (connection is "failed" or "closed" && connected) Fail("Disconnected · close this window and connect again.");
+                else if (connection == "disconnected" && connected) state.Text = "Connection interrupted · waiting for the network…";
+                else if (connection == "connected" && connected) ApplyStatus(peer.Status);
+                break;
+            case "route": route = m.GetProperty("relay").GetBoolean() ? " · relayed" : " · direct"; break;
+            case "release": enableInput.Checked = false; break;
+            case "escape": if (fullScreen) ToggleFullscreen(); break;
+            case "hint": state.Text = peer.Status.Control ? "Input paused · enable Send keyboard and mouse" : "View only · ask the host to allow control"; break;
+            case "screenshot": screenshot?.TrySetResult(m.GetProperty("data").GetBytesFromBase64()); break;
+            case "recording": WriteRecording(m.GetProperty("data").GetBytesFromBase64()); break;
+            case "recorded": FinishRecording(); break;
+            case "failed": Fail("The session could not start: " + m.GetProperty("message").GetString()); break;
         }
     }
-    private void OpenChat(){if(chat is null||chat.IsDisposed)chat=new ChatForm(Text,text=>session.SendMessageAsync(Wire.Json(MessageKind.Chat,text),stop.Token));if(!chat.Visible)chat.Show(this);else chat.Activate();}
-    private async Task ReceiveMessageAsync(OpenDesk.Core.Message message,CancellationToken ct)
+
+    private void ApplyStatus(SessionStatus status)
     {
-        if(message.Kind is MessageKind.Chat or MessageKind.Clipboard){string text=Wire.Decode<string>(message);if(text.Length>2000)throw new InvalidDataException("Text message is too long.");
-            if(message.Kind==MessageKind.Chat)Ui(()=>{OpenChat();chat!.Append("Remote",text);});
-            else Ui(()=>{try{Clipboard.SetText(text);state.Text="Received clipboard text";}catch(System.Runtime.InteropServices.ExternalException){state.Text="Clipboard is busy";}});
-        }else await files.ReceiveAsync(message,ct);
+        if (!connected) return;
+        state.Text = (status.Control ? "Connected · You have control" : "Connected · View only") + route;
+        enableInput.Enabled = status.Control;
+        if (status.Control && !hadControl) enableInput.Checked = true;
+        if (!status.Control) enableInput.Checked = false;
+        hadControl = status.Control;
+        fileButton.Enabled = status.Files; clipboardButton.Enabled = status.Clipboard;
+        PostStatus();
     }
-    private void SaveScreenshot()
+    private void PostStatus() { var s = peer.Status; Post(new { t = "status", control = s.Control, epoch = s.Epoch, display = s.Display, input = enableInput.Checked && connected && !locallyControlled() }); }
+    // Called when this PC's own remote control changes.
+    internal void RefreshInput() { if (connected) { PostStatus(); if (locallyControlled() && enableInput.Checked) state.Text = "Input paused while this PC is being controlled remotely"; } }
+    private void Show(string text) { state.Text = text; Post(new { t = "message", text }); }
+    private void Fail(string text)
     {
-        using var image=picture.Snapshot();if(image is null)return;using var dialog=new SaveFileDialog{Filter="PNG image|*.png",FileName="OpenDesk-"+DateTime.Now.ToString("yyyyMMdd-HHmmss")+".png",OverwritePrompt=true};if(dialog.ShowDialog(this)==DialogResult.OK){try{image.Save(dialog.FileName,System.Drawing.Imaging.ImageFormat.Png);}catch(Exception ex){state.Text=ex.Message;}}
+        connected = false; enableInput.Checked = enableInput.Enabled = false; fileButton.Enabled = clipboardButton.Enabled = false;
+        Show(text); Post(new { t = "close" }); stop.Cancel();
+    }
+    private void Post(object message) => WebEngine.Post(page, message);
+    private void Ui(Action action) { if (!IsDisposed && IsHandleCreated) { try { BeginInvoke(action); } catch (InvalidOperationException) { } } }
+
+    private void OpenChat()
+    {
+        if (chat is null || chat.IsDisposed) chat = new ChatForm(Text, text => peer.SendMessageAsync(Wire.Json(MessageKind.Chat, text), stop.Token));
+        if (!chat.Visible) chat.Show(this); else chat.Activate();
+    }
+    private async Task ReceiveMessageAsync(OpenDesk.Core.Message message, CancellationToken ct)
+    {
+        if (message.Kind is MessageKind.Chat or MessageKind.Clipboard) {
+            string text = Wire.Decode<string>(message);
+            if (message.Kind == MessageKind.Chat) Ui(() => { OpenChat(); chat!.Append("Remote", text); });
+            else Ui(() => { try { Clipboard.SetText(text); state.Text = "Received clipboard text"; } catch (System.Runtime.InteropServices.ExternalException) { state.Text = "Clipboard is busy"; } });
+        }
+        else await files.ReceiveAsync(message, ct);
+    }
+
+    private async Task SaveScreenshotAsync()
+    {
+        if (!connected) return;
+        screenshot = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Post(new { t = "screenshot" });
+        byte[] png;
+        try { png = await screenshot.Task.WaitAsync(TimeSpan.FromSeconds(10)); } catch (TimeoutException) { state.Text = "Screenshot failed"; return; }
+        using var dialog = new SaveFileDialog { Filter = "PNG image|*.png", FileName = "OpenDesk-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".png", OverwritePrompt = true };
+        if (dialog.ShowDialog(this) == DialogResult.OK) { try { await File.WriteAllBytesAsync(dialog.FileName, png); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { state.Text = ex.Message; } }
     }
     private void ToggleRecording()
     {
-        if(recorder is not null){StopRecording();return;}
-        var size=picture.ImageSize;if(size.IsEmpty)return;using var dialog=new SaveFileDialog{Filter="Motion JPEG video|*.avi",FileName="OpenDesk-"+DateTime.Now.ToString("yyyyMMdd-HHmmss")+".avi",OverwritePrompt=true};if(dialog.ShowDialog(this)==DialogResult.OK){try{lock(recordingGate){recorder=new(dialog.FileName,size.Width,size.Height);recordingTimer??=new(_=>RecordFrame(),null,0,100);}recordButton.Text="Stop recording";state.Text="Recording session…";}catch(Exception ex){state.Text=ex.Message;}}
+        if (recording is not null) { Post(new { t = "record", on = false }); recordButton.Text = "Record"; return; }
+        if (!connected) return;
+        using var dialog = new SaveFileDialog { Filter = "WebM video|*.webm", FileName = "OpenDesk-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".webm", OverwritePrompt = true };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        try { recording = new FileStream(dialog.FileName, FileMode.Create, FileAccess.Write, FileShare.Read); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { state.Text = ex.Message; return; }
+        Post(new { t = "record", on = true }); recordButton.Text = "Stop recording"; state.Text = "Recording session…";
     }
+    private void WriteRecording(byte[] chunk)
+    {
+        if (recording is null) return;
+        try {
+            recording.Write(chunk);
+            if (recording.Length > MaxRecording) { Post(new { t = "record", on = false }); recordButton.Text = "Record"; state.Text = "Recording stopped at the 1.5 GB limit"; }
+        }
+        catch (IOException ex) { Post(new { t = "record", on = false }); StopRecording(); state.Text = "Recording stopped: " + ex.Message; }
+    }
+    private void FinishRecording() { StopRecording(); state.Text = "Recording saved"; }
+    private void StopRecording() { recording?.Dispose(); recording = null; recordButton.Text = "Record"; }
     private void ToggleFullscreen()
     {
-        if(!fullScreen){previousState=WindowState;previousBounds=Bounds;FormBorderStyle=FormBorderStyle.None;WindowState=FormWindowState.Normal;Bounds=Screen.FromControl(this).Bounds;fullScreen=true;}
-        else{FormBorderStyle=FormBorderStyle.Sizable;WindowState=FormWindowState.Normal;Bounds=previousBounds;WindowState=previousState;fullScreen=false;}
+        if (!fullScreen) { previousState = WindowState; previousBounds = Bounds; FormBorderStyle = FormBorderStyle.None; WindowState = FormWindowState.Normal; Bounds = Screen.FromControl(this).Bounds; fullScreen = true; }
+        else { FormBorderStyle = FormBorderStyle.Sizable; WindowState = FormWindowState.Normal; Bounds = previousBounds; WindowState = previousState; fullScreen = false; }
     }
-    private void StopRecording(){lock(recordingGate){var active=recorder;recorder=null;recordingTimer?.Dispose();recordingTimer=null;Ui(()=>recordButton.Text="Record");if(active is null)return;try{active.Dispose();Ui(()=>state.Text="Recording saved");}catch(Exception ex)when(ex is IOException or UnauthorizedAccessException){Ui(()=>state.Text="Recording could not be finalized: "+ex.Message);}}}
 }

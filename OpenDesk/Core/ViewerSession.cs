@@ -64,7 +64,7 @@ public sealed class ViewerSession : IAsyncDisposable
                 }
                 else if (message.Kind == MessageKind.Status) { var next = Wire.Decode<SessionStatus>(message); if (next.Epoch >= Status.Epoch) { Status = next; status(Status); } }
                 else if(message.Kind is MessageKind.Chat or MessageKind.Clipboard or MessageKind.FileOffer or MessageKind.FileChunk or MessageKind.FileFinish or MessageKind.FileAck) {
-                    if(message.Kind==MessageKind.Clipboard&&!Status.Clipboard || message.Kind is >=MessageKind.FileOffer and <=MessageKind.FileAck && !Status.Files)throw new InvalidDataException("Unapproved capability.");
+                    if(!Status.Allows(message.Kind))throw new InvalidDataException("Unapproved capability.");
                     if(MessageReceived is not null)await MessageReceived(message,running.Token);
                 }
                 else throw new InvalidDataException("Unexpected host message.");
@@ -95,7 +95,7 @@ public sealed class ViewerSession : IAsyncDisposable
     }
     public Task SendMessageAsync(Message message,CancellationToken ct)
     {
-        if(message.Kind==MessageKind.Clipboard&&!Status.Clipboard || message.Kind is >=MessageKind.FileOffer and <=MessageKind.FileAck && !Status.Files)throw new UnauthorizedAccessException("The host did not grant this capability.");
+        if(!Status.Allows(message.Kind))throw new UnauthorizedAccessException("The host did not grant this capability.");
         if(message.Kind is not (MessageKind.Chat or MessageKind.Clipboard or MessageKind.FileOffer or MessageKind.FileChunk or MessageKind.FileFinish or MessageKind.FileAck))throw new InvalidOperationException("Invalid session action.");
         return WriteAsync(message,ct);
     }

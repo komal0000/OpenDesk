@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace OpenDesk.Core;
 
-public enum MessageKind : byte { Hello = 1, Accepted = 2, Status = 3, Frame = 4, Input = 5, Rejected = 6, Ping = 7, Chat = 8, Clipboard = 9, FileOffer = 10, FileChunk = 11, FileFinish = 12, FileAck = 13, FrameAck = 14, Tiles = 15 }
+public enum MessageKind : byte { Hello = 1, Accepted = 2, Status = 3, Frame = 4, Input = 5, Rejected = 6, Ping = 7, Chat = 8, Clipboard = 9, FileOffer = 10, FileChunk = 11, FileFinish = 12, FileAck = 13, FrameAck = 14, Tiles = 15, Keyframe = 16 }
 public sealed record Message(MessageKind Kind, byte[] Payload);
 
 public static class Wire
@@ -20,15 +20,27 @@ public static class Wire
     public static async Task WriteAsync(Stream stream, Message message, CancellationToken ct)
     {
         Validate(message.Kind, message.Payload.Length);
-        if(message.Payload.Length<=MaxControl){
-            byte[] packet=new byte[5+message.Payload.Length];packet[0]=(byte)message.Kind;
-            BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(1),message.Payload.Length);message.Payload.CopyTo(packet,5);
-            await stream.WriteAsync(packet,ct);return;
-        }
+        if(message.Payload.Length<=MaxControl){await stream.WriteAsync(Pack(message),ct);return;}
         byte[] header = new byte[5]; header[0] = (byte)message.Kind;
         BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(1), message.Payload.Length);
         await stream.WriteAsync(header, ct);
         await stream.WriteAsync(message.Payload, ct);
+    }
+    // The same frame as one byte array, for transports that carry whole messages (WebRTC data channels).
+    public static byte[] Pack(Message message)
+    {
+        Validate(message.Kind, message.Payload.Length);
+        byte[] packet = new byte[5 + message.Payload.Length]; packet[0] = (byte)message.Kind;
+        BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(1), message.Payload.Length); message.Payload.CopyTo(packet, 5);
+        return packet;
+    }
+    public static Message Unpack(ReadOnlySpan<byte> packet)
+    {
+        if (packet.Length < 5) throw new InvalidDataException("Truncated message.");
+        var kind = (MessageKind)packet[0]; int length = BinaryPrimitives.ReadInt32BigEndian(packet[1..]);
+        Validate(kind, length);
+        if (packet.Length != 5 + length) throw new InvalidDataException("Message length mismatch.");
+        return new(kind, packet[5..].ToArray());
     }
     public static async Task<Message> ReadAsync(Stream stream, CancellationToken ct) => (await ReadTimedAsync(stream, ct)).Message;
     // Also returns when the header arrived, so a viewer can report how long the payload took.

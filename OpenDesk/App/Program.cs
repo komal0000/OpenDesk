@@ -7,13 +7,12 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
         Application.AddMessageFilter(new RemoteInputFilter());
+        // Checks this PC can capture and encode the primary display; reports which H.264 encoder it uses.
         if (args.Contains("--capture-smoke")) {
-            try {
-                using var capture=new ScreenCapture(Screen.PrimaryScreen!.Bounds);var frame = capture.Frame();
-                var dimensions = OpenDesk.Core.JpegDimensions.Read(frame.Jpeg);
-                if (dimensions != (frame.Width, frame.Height)) throw new InvalidDataException("Capture dimensions differ.");
-                File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "capture-smoke.txt"), $"PASS {frame.Width}x{frame.Height}, {frame.Jpeg.Length} encoded bytes");
-            } catch (Exception ex) { File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "capture-smoke.txt"), "FAIL " + ex.GetType().Name); Environment.ExitCode = 1; }
+            string result;
+            try { result = CaptureSmoke.Run(Screen.PrimaryScreen!.Bounds); }
+            catch (Exception ex) { result = "FAIL " + ex.Message; Environment.ExitCode = 1; }
+            File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "capture-smoke.txt"), result);
             return;
         }
         using var main = new MainForm(!args.Any(a => a is "--smoke" or "--ui-smoke"));

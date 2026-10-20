@@ -6,7 +6,61 @@ Check `uname -m` (must say x86_64) and `cat /etc/os-release` first.
 It is not an ARM64 or Alpine/musl package. Linux execution has not yet been
 verified on the user's VPS: SSH password authentication must be performed locally.
 
-## Transfer and install
+## Upgrading an existing server to 0.4 (WebRTC sessions)
+
+OpenDesk 0.4 apps need this service version: it adds WebSocket signaling on the same
+HTTPS port (47834). Device IDs and the certificate fingerprint are kept, so clients
+need no new settings. The old 0.3 relay keeps running for 0.3 installs.
+
+```powershell
+.\publish-linux.ps1
+scp .\artifacts\OpenDesk-Service-linux-x64.tar.gz ubuntu@139.99.135.69:~/
+ssh ubuntu@139.99.135.69
+```
+
+On the VPS:
+
+```bash
+rm -rf ~/opendesk-upload && mkdir -p ~/opendesk-upload
+tar -xzf ~/OpenDesk-Service-linux-x64.tar.gz -C ~/opendesk-upload
+cd ~/opendesk-upload
+sudo bash ./upgrade.sh
+sudo bash ./setup-turn.sh 139.99.135.69
+curl -sk https://localhost:47834/v2/info
+```
+
+`/v2/info` must print `{"protocol":2,"signaling":true}`. `upgrade.sh` keeps the
+previous binary and unit as `.before-<time>` files for rollback.
+
+### TURN (sessions across different networks)
+
+Two PCs on one network connect directly. Across networks WebRTC first tries a direct
+path through both routers; when carrier-grade NAT or a firewall blocks that, traffic
+relays through TURN on this server. `setup-turn.sh` installs coturn, creates a random
+shared secret in `/var/lib/opendesk/turn-secret`, writes `/etc/turnserver.conf`
+(relaying to public addresses only) and `/etc/opendesk.env`, and restarts both
+services. The service then hands each session TURN credentials valid for one hour.
+Without TURN, sessions still work on the same network and through routers that allow
+direct paths.
+
+Open these in the VPS provider firewall (and UFW if it is active):
+
+| Port | Use |
+| --- | --- |
+| TCP 47834 | HTTPS directory and v2 signaling |
+| UDP 3478, TCP 3478 | TURN |
+| UDP 49160–49200 | TURN relay traffic |
+| TCP 47832 | 0.3 relay; close it once no 0.3 clients remain |
+
+```bash
+sudo ufw allow 3478
+sudo ufw allow 49160:49200/udp
+```
+
+TURN bandwidth is counted against the VPS. A relayed 720p session uses roughly
+4–8 Mbit/s per viewer while the screen changes, and close to nothing when it is still.
+
+## Transfer and install (new server)
 
 On your Windows PC, from the folder containing the archive, run:
 

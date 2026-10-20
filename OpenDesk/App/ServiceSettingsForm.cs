@@ -45,8 +45,9 @@ internal sealed class ServiceSettingsForm : Form
                 await Task.Delay(300);
                 if(IsDisposed)return;
                 if(!settings.TryLocalService()) continue;
-                try { using var check=new DirectoryClient(settings.ServiceUrl,settings.ServicePin); await check.InfoAsync(default); url.Text=settings.ServiceUrl; pin.Text=settings.ServicePin; return; }
-                catch(HttpRequestException) { }
+                // Ready means it answers the v2 signaling check, so an old instance still running is not accepted.
+                try { using var check=new DirectoryClient(settings.ServiceUrl,settings.ServicePin); if(await check.SupportsSignalingAsync(default)){url.Text=settings.ServiceUrl; pin.Text=settings.ServicePin; return;} }
+                catch(Exception ex) when (ex is HttpRequestException or IOException) { }
             }
             throw new IOException("The service did not become ready. Check whether its ports are already in use.");
         } catch(Exception ex) { if(!IsDisposed)MessageBox.Show(this,ex.Message,"Local service",MessageBoxButtons.OK,MessageBoxIcon.Information); }

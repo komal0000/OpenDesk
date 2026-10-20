@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8"><title>Probe viewer</title>
+<body style="margin:0;background:#222">
+<video autoplay muted playsinline style="width:100%;height:100%;object-fit:contain"></video>
+<canvas width="4" height="4" hidden></canvas>
+<script src="common.js"></script>
+<script>
+const video = document.querySelector('video');
+const pixels = document.querySelector('canvas').getContext('2d', { willReadFrequently: true });
+const sent = {}, dcRtt = [];
+let dc, firstFrame = false;
+pc = new RTCPeerConnection();
+pc.onicecandidate = e => e.candidate && post({ type: 'signal', candidate: e.candidate.toJSON() });
+pc.ondatachannel = e => {
+  dc = e.channel;
+  dc.onmessage = m => { const { ack } = JSON.parse(m.data); dcRtt.push(performance.now() - sent[ack]); };
+  dc.onopen = live;
+};
+pc.ontrack = e => {
+  e.receiver.jitterBufferTarget = 0;  // ask for the smallest playout buffer
+  e.receiver.playoutDelayHint = 0;    // older Chromium name for the same hint
+  video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+  video.requestVideoFrameCallback(() => { firstFrame = true; live(); });
+};
+function live() { if (firstFrame && dc?.readyState === 'open') post({ type: 'live' }); }
+
+chrome.webview.addEventListener('message', async e => {
+  const m = e.data;
+  if (m.type === 'signal') {
+    if (m.desc) { await pc.setRemoteDescription(m.desc); await pc.setLocalDescription(); post({ type: 'signal', desc: pc.localDescription.toJSON() }); }
+    if (m.candidate) await pc.addIceCandidate(m.candidate);
+  }
+  else if (m.type === 'marker') run(m);
+});
+
+// Resolves at the next decoded video frame, or null after 3 s without one.
+const frame = () => new Promise(resolve => { video.requestVideoFrameCallback(() => resolve(performance.now())); setTimeout(() => resolve(null), 3000); });
+function luma(marker) {
+  pixels.drawImage(video, marker.x * video.videoWidth - 2, marker.y * video.videoHeight - 2, 4, 4, 0, 0, 4, 4);
+  const d = pixels.getImageData(0, 0, 4, 4).data; let sum = 0;
+  for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  return sum / 16;
+}
+const seen = [];
+async function waitFor(marker, white, timeout) {
+  const start = performance.now(); let low = 255, high = 0, frames = 0;
+  try {
+    while (performance.now() - start < timeout) {
+      const t = await frame();
+      if (t === null) continue;
+      frames++;
+      const l = luma(marker); low = Math.min(low, l); high = Math.max(high, l);
+      if (white ? l > 180 : l < 70) return t;
+    }
+    return null;
+  } finally { seen.push([Math.round(low), Math.round(high), frames]); }
+}
+async function run(marker) {
+  await new Promise(r => setTimeout(r, 8000));  // let bandwidth estimation ramp up to full quality
+  if (await waitFor(marker, false, 5000) === null) throw new Error('Marker not visible in the received video');
+  const clicks = []; let white = false, failed = null;
+  for (let seq = 1; seq <= marker.samples; seq++) {
+    white = !white;
+    const t0 = sent[seq] = performance.now();
+    dc.send(JSON.stringify({ seq, click: true }));
+    const t1 = await waitFor(marker, white, 3000);
+    // A missed change leaves the marker state unknown, so stop and keep only the samples before it.
+    if (t1 === null) { failed = `Click ${seq}: marker change not seen in the video; was the probe window covered?`; break; }
+    clicks.push(t1 - t0);    await new Promise(r => setTimeout(r, 150 + Math.random() * 150));
+  }
+  const stats = await videoStats('inbound-rtp');
+  stats.avgJitterBufferMs = 1000 * stats.jitterBufferDelay / stats.jitterBufferEmittedCount;
+  stats.avgDecodeMs = 1000 * stats.totalDecodeTime / stats.framesDecoded;
+  post({ type: 'result', failed, clicks, dcRtt, stats, seen, marker, video: { width: video.videoWidth, height: video.videoHeight } });
+}
+post({ type: 'ready' });
+</script>

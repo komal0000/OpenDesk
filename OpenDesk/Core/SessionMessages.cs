@@ -3,13 +3,22 @@ using System.Buffers.Binary;
 namespace OpenDesk.Core;
 
 public sealed record Approval(bool Accept, bool Control = false, bool Clipboard = false, bool Files = false);
-public sealed record SessionStatus(bool Control, long Epoch, string Text, bool Clipboard = false, bool Files = false, bool FrameAcks = false, bool Tiles = false);
+// Epoch changes with every control or display change; Display only when the shared monitor changes,
+// so a viewer knows which video frames match the coordinates it sends.
+public sealed record SessionStatus(bool Control, long Epoch, string Text, bool Clipboard = false, bool Files = false, bool FrameAcks = false, bool Tiles = false, long Display = 0)
+{
+    public static bool IsFile(MessageKind kind) => kind is >= MessageKind.FileOffer and <= MessageKind.FileAck;
+    // Clipboard text and files need the host's approval; everything else is always allowed.
+    public bool Allows(MessageKind kind) => kind == MessageKind.Clipboard ? Clipboard : !IsFile(kind) || Files;
+}
 public sealed record ViewerInfo(Guid Id, string Name, bool Control);
-public sealed record InputEvent(string Kind, double X = 0, double Y = 0, int Code = 0, bool Down = false, long Epoch = 0, int Delta = 0)
+// Key: W3C KeyboardEvent.code ("KeyA", "ShiftLeft"), a physical key position; when set, Code is unused.
+public sealed record InputEvent(string Kind, double X = 0, double Y = 0, int Code = 0, bool Down = false, long Epoch = 0, int Delta = 0, string? Key = null)
 {
     public bool IsValid => double.IsFinite(X) && double.IsFinite(Y) && X is >= 0 and <= 1 && Y is >= 0 and <= 1 &&
         Kind switch { "move" or "reset" => true, "button" => Code is >= 1 and <= 3,
-            "key" => Code is >= 1 and <= 255, "wheel" => Delta is >= -1200 and <= 1200, _ => false };
+            "key" => Key is null ? Code is >= 1 and <= 255 : Key.Length is >= 2 and <= 24 && Key.All(char.IsAsciiLetterOrDigit),
+            "wheel" => Delta is >= -1200 and <= 1200, _ => false };
 }
 public interface IInputSink { void Apply(InputEvent input); void ReleaseAll(); }
 public sealed record ScreenFrame(int Width, int Height, byte[] Jpeg, long Epoch=0)

@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using static OpenDesk.App.Com;
 
 namespace OpenDesk.App;
 
@@ -21,13 +22,11 @@ internal sealed unsafe class DesktopDuplication : IDisposable
     private nint device,context,duplication,staging;
     private bool holding,mapped;
     private byte[] metadata=[];
+    private readonly List<Rectangle> changed=[];
+    private readonly Point origin;
     internal int Width{get;}
     internal int Height{get;}
-    private DesktopDuplication(nint device,nint context,nint duplication,int width,int height){this.device=device;this.context=context;this.duplication=duplication;Width=width;Height=height;}
-
-    private static nint Slot(nint com,int index)=>(*(nint**)com)[index];
-    private static void Release(ref nint com){if(com!=0){((delegate* unmanaged[Stdcall]<nint,uint>)Slot(com,2))(com);com=0;}}
-    private static int Query(nint com,Guid iid,out nint result){nint value;int hr=((delegate* unmanaged[Stdcall]<nint,Guid*,nint*,int>)Slot(com,0))(com,&iid,&value);result=value;return hr;}
+    private DesktopDuplication(nint device,nint context,nint duplication,Rectangle bounds){this.device=device;this.context=context;this.duplication=duplication;origin=bounds.Location;Width=bounds.Width;Height=bounds.Height;}
 
     // Null when this monitor cannot be duplicated (remote session, rotated or secure desktop, old driver).
     internal static DesktopDuplication? TryCreate(Rectangle bounds)
@@ -49,7 +48,7 @@ internal sealed unsafe class DesktopDuplication : IDisposable
                     if(((delegate* unmanaged[Stdcall]<nint,nint,nint*,int>)Slot(output1,22))(output1,device,&duplication)<0)return null;
                     DuplicationDesc info;((delegate* unmanaged[Stdcall]<nint,DuplicationDesc*,void>)Slot(duplication,7))(duplication,&info);
                     if(info.Rotation>1||info.Width!=bounds.Width||info.Height!=bounds.Height)return null;
-                    var result=new DesktopDuplication(device,context,duplication,bounds.Width,bounds.Height);device=context=duplication=0;return result;
+                    var result=new DesktopDuplication(device,context,duplication,bounds);device=context=duplication=0;return result;
                 }
             }
         }
@@ -60,12 +59,12 @@ internal sealed unsafe class DesktopDuplication : IDisposable
     // Maps the newest desktop image when the screen changed since the last call. Unmap afterwards.
     // The first image is copied whole; later ones copy only their changed areas into the mirror.
     // Throws when duplication was lost (mode change, desktop switch); recreate it later.
-    // `changed` receives the desktop areas that differ from the previous mapped image.
-    internal bool TryMap(out byte* data,out int pitch,List<Rectangle> changed)
+    // Waits up to `timeout` ms for a change; pointer movement also ends the wait.
+    internal bool TryMap(out byte* data,out int pitch,uint timeout=0)
     {
         data=null;pitch=0;Unmap();changed.Clear();ReleaseFrame();
         FrameInfo info;nint resource;
-        int hr=((delegate* unmanaged[Stdcall]<nint,uint,FrameInfo*,nint*,int>)Slot(duplication,8))(duplication,0,&info,&resource);
+        int hr=((delegate* unmanaged[Stdcall]<nint,uint,FrameInfo*,nint*,int>)Slot(duplication,8))(duplication,timeout,&info,&resource);
         if(hr==WaitTimeout)return false;
         if(hr<0)throw new IOException($"Desktop duplication stopped (0x{hr:X8}).");
         holding=true;
@@ -74,10 +73,7 @@ internal sealed unsafe class DesktopDuplication : IDisposable
             if(info.LastPresent==0)return false;
             if(Query(resource,Texture2D,out var texture)<0)throw new IOException("Desktop image unavailable.");
             try{
-                if(staging==0){
-                    var desc=new TextureDesc{Width=(uint)Width,Height=(uint)Height,Mips=1,Array=1,Format=87,SampleCount=1,Usage=3,CpuAccess=0x20000};nint created;
-                    if(((delegate* unmanaged[Stdcall]<nint,TextureDesc*,nint,nint*,int>)Slot(device,5))(device,&desc,0,&created)<0)throw new IOException("Could not allocate a capture texture.");staging=created;
-                }
+                if(staging==0)CreateStaging();
                 else ChangedAreas(info.Metadata,changed);
                 // The staging texture mirrors the desktop, so only changed areas need copying from the GPU.
                 if(changed.Count is 0 or >32){changed.Clear();changed.Add(new(0,0,Width,Height));((delegate* unmanaged[Stdcall]<nint,nint,nint,void>)Slot(context,47))(context,staging,texture);}
@@ -86,10 +82,40 @@ internal sealed unsafe class DesktopDuplication : IDisposable
                     ((delegate* unmanaged[Stdcall]<nint,nint,uint,uint,uint,uint,nint,uint,uint*,void>)Slot(context,46))(context,staging,0,(uint)r.Left,(uint)r.Top,0,texture,0,box);
                 }}
             }finally{Release(ref texture);}
-            Mapped map;
-            if(((delegate* unmanaged[Stdcall]<nint,nint,uint,uint,uint,Mapped*,int>)Slot(context,14))(context,staging,0,1,0,&map)<0)throw new IOException("Could not read the desktop image.");
-            mapped=true;data=map.Data;pitch=(int)map.RowPitch;return true;
+            return MapCurrent(out data,out pitch);
         }finally{Release(ref resource);}
+    }
+    // Maps the last captured image again, for re-encoding when the screen did not change. Unmap afterwards.
+    internal bool MapCurrent(out byte* data,out int pitch)
+    {
+        data=null;pitch=0;Unmap();if(staging==0)SeedFromScreen();
+        Mapped map;
+        if(((delegate* unmanaged[Stdcall]<nint,nint,uint,uint,uint,Mapped*,int>)Slot(context,14))(context,staging,0,1,0,&map)<0)throw new IOException("Could not read the desktop image.");
+        mapped=true;data=map.Data;pitch=(int)map.RowPitch;return true;
+    }
+    // A CPU-readable and -writable texture that mirrors the desktop.
+    private void CreateStaging()
+    {
+        var desc=new TextureDesc{Width=(uint)Width,Height=(uint)Height,Mips=1,Array=1,Format=87,SampleCount=1,Usage=3,CpuAccess=0x30000};nint created;
+        if(((delegate* unmanaged[Stdcall]<nint,TextureDesc*,nint,nint*,int>)Slot(device,5))(device,&desc,0,&created)<0)throw new IOException("Could not allocate a capture texture.");staging=created;
+    }
+    // Duplication reports nothing until the screen changes, so a still screen would never be shown.
+    // The mirror therefore starts as a GDI copy; duplication then reports every change made after it.
+    private void SeedFromScreen()
+    {
+        using var bitmap=new Bitmap(Width,Height,System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+        try{using var g=Graphics.FromImage(bitmap);g.CopyFromScreen(origin,Point.Empty,new Size(Width,Height));}
+        catch(System.ComponentModel.Win32Exception ex){throw new IOException("The desktop could not be read.",ex);} // secure desktop
+        var bits=bitmap.LockBits(new Rectangle(0,0,Width,Height),System.Drawing.Imaging.ImageLockMode.ReadOnly,System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+        CreateStaging();
+        try{
+            Mapped map;
+            if(((delegate* unmanaged[Stdcall]<nint,nint,uint,uint,uint,Mapped*,int>)Slot(context,14))(context,staging,0,2,0,&map)<0)throw new IOException("Could not prepare the desktop image."); // D3D11_MAP_WRITE
+            for(int y=0;y<Height;y++)Buffer.MemoryCopy((byte*)bits.Scan0+(long)y*bits.Stride,map.Data+(long)y*map.RowPitch,Width*4,Width*4);
+            ((delegate* unmanaged[Stdcall]<nint,nint,uint,void>)Slot(context,15))(context,staging,0);
+        }
+        catch{Release(ref staging);throw;}
+        finally{bitmap.UnlockBits(bits);}
     }
     // Moved and dirty rectangles of the acquired frame, clipped to the output.
     private void ChangedAreas(uint size,List<Rectangle> changed)
