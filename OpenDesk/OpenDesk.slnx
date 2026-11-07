@@ -17,4 +17,16 @@
   <Folder Name="/Service/">
     <Project Path="Service/OpenDesk.Service.csproj" />
   </Folder>
+  <Folder Name="/Desktop/">
+    <Project Path="Desktop/OpenDesk.Desktop.csproj" />
+  </Folder>
+  <Folder Name="/Transport/">
+    <Project Path="Transport/OpenDesk.Transport.csproj" />
+  </Folder>
+  <Folder Name="/UI/">
+    <Project Path="UI/OpenDesk.UI.csproj" />
+  </Folder>
+  <Folder Name="/Video.FFmpeg/">
+    <Project Path="Video.FFmpeg/OpenDesk.Video.FFmpeg.csproj" />
+  </Folder>
 </Solution>

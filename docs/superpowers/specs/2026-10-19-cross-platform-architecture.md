@@ -1,6 +1,6 @@
 # Cross-platform OpenDesk: architecture plan
 
-Date: 2026-10-19. Status: proposal, not started.
+Date: 2026-10-19. Status: phase 1 done on Windows (WebView2, see `2026-10-19-desktop-webrtc-v2.md`); phase 2 started with the desktop Avalonia viewer (`OpenDesk/Desktop/README.md`).
 
 ## Goal
 
