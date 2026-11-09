@@ -14,8 +14,8 @@ public static class DeviceProof
         JsonSerializer.SerializeToUtf8Bytes(new { Scope = "OpenDesk directory v1", Challenge = challenge, PublicKey = publicKey, Session = session, Owner = owner });
     public static DeviceRegistration Sign(ECDsa key, string challenge, Invitation session, string owner = "")
     {
-        string publicKey = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
-        return new(challenge, publicKey, Convert.ToBase64String(key.SignData(Data(challenge, publicKey, session, owner), HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation)), session, owner);
+        string publicKey = SignalProof.PublicKey(key);
+        return new(challenge, publicKey, SignalProof.Sign(key, Data(challenge, publicKey, session, owner)), session, owner);
     }
     public static string NormalizeId(string text)
     {
@@ -53,33 +53,52 @@ public sealed class DeviceRegistry
     public DeviceAddress Register(DeviceRegistration request, DateTimeOffset now)
     {
         lock (gate) {
-            if (!Invitation.IsHex(request.Challenge,64) || !challenges.Remove(request.Challenge, out var until) || until <= now)
-                throw new UnauthorizedAccessException("Registration challenge is invalid or expired.");
+            TakeChallenge(request.Challenge, now);
             try {
-                if (request.PublicKey is null || request.PublicKey.Length > 256 || request.Signature is null || request.Signature.Length > 128 || request.Session is null) throw new CryptographicException();
-                byte[] pub = Convert.FromBase64String(request.PublicKey), sig = Convert.FromBase64String(request.Signature);
-                using var key = ECDsa.Create(); key.ImportSubjectPublicKeyInfo(pub, out int used);
-                if (used != pub.Length || key.KeySize != 256 || key.ExportParameters(false).Curve.Oid.Value != ECCurve.NamedCurves.nistP256.Oid.Value ||
-                    !key.VerifyData(DeviceProof.Data(request.Challenge, request.PublicKey, request.Session, request.RelayOwner), sig, HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation)) throw new CryptographicException();
+                if (request.PublicKey is null || request.Session is null ||
+                    !SignalProof.Verify(request.PublicKey, DeviceProof.Data(request.Challenge, request.PublicKey, request.Session, request.RelayOwner), request.Signature)) throw new CryptographicException();
+                byte[] pub = Convert.FromBase64String(request.PublicKey);
                 var session = request.Session;
                 _ = Invitation.Parse((session with { Expires = now.AddMinutes(1) }).Encode(), now);
                 if (session.Mode != "relay" || session.Expires <= now || !roomOnline(session.Room) || !ownsRoom(session, request.RelayOwner)) throw new UnauthorizedAccessException("Host relay registration is not online or not owned by this request.");
-                string fingerprint = Convert.ToHexString(SHA256.HashData(pub));
-                if (!ids.TryGetValue(fingerprint, out string? id)) {
-                    if (ids.Count >= 100_000) throw new InvalidOperationException("Directory is full.");
-                    do { id = RandomNumberGenerator.GetInt32(100_000_000,1_000_000_000).ToString(System.Globalization.CultureInfo.InvariantCulture); } while (ids.ContainsValue(id));
-                    ids.Add(fingerprint,id);
-                    try {
-                        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path))!);
-                        File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(ids)); File.Move(path + ".tmp", path, true);
-                    } catch { ids.Remove(fingerprint); throw; }
-                }
+                string id = IdFor(pub);
                 if (leases.TryGetValue(id, out var existing) && existing.Until > now && existing.Session.Room != session.Room && roomOnline(existing.Session.Room))
                     throw new InvalidOperationException("This device is already online in another window.");
                 leases[id] = (session, now.AddSeconds(60)); return new(id, "OpenDesk device");
             }
             catch (Exception ex) when (ex is FormatException or CryptographicException or ArgumentException) { throw new UnauthorizedAccessException("Device ownership proof is invalid."); }
         }
+    }
+    // v2: a host proves its device key over the signaling socket and learns its persistent ID. The
+    // caller issues `challenge` fresh for that one socket, which makes it single-use; the socket itself is
+    // the lease, so nothing else is stored here.
+    public string RegisterSignaling(string challenge, string publicKey, string? signature)
+    {
+        lock (gate) {
+            if (!Invitation.IsHex(challenge,64)) throw new UnauthorizedAccessException("Registration challenge is invalid.");
+            if (!SignalProof.Verify(publicKey, SignalProof.Register(challenge, publicKey), signature)) throw new UnauthorizedAccessException("Device ownership proof is invalid.");
+            return IdFor(Convert.FromBase64String(publicKey));
+        }
+    }
+    // Each challenge proves freshness once. Call under the lock.
+    private void TakeChallenge(string challenge, DateTimeOffset now)
+    {
+        if (!Invitation.IsHex(challenge,64) || !challenges.Remove(challenge, out var until) || until <= now)
+            throw new UnauthorizedAccessException("Registration challenge is invalid or expired.");
+    }
+    // The persistent ID for a public key, assigned and saved on first use. Call under the lock.
+    private string IdFor(byte[] publicKey)
+    {
+        string fingerprint = Convert.ToHexString(SHA256.HashData(publicKey));
+        if (ids.TryGetValue(fingerprint, out string? id)) return id;
+        if (ids.Count >= 100_000) throw new InvalidOperationException("Directory is full.");
+        do { id = RandomNumberGenerator.GetInt32(100_000_000,1_000_000_000).ToString(System.Globalization.CultureInfo.InvariantCulture); } while (ids.ContainsValue(id));
+        ids.Add(fingerprint,id);
+        try {
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path))!);
+            File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(ids)); File.Move(path + ".tmp", path, true);
+        } catch { ids.Remove(fingerprint); throw; }
+        return id;
     }
     public DeviceLookup? Lookup(string id, DateTimeOffset now)
     {

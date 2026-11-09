@@ -5,8 +5,8 @@ using System.Security.Cryptography.X509Certificates;
 
 namespace OpenDesk.Core;
 
-public sealed record Hello(int Version, string Secret, string Name, bool FrameAcks = false);
-public sealed record AuthenticatedPeer(SslStream Stream, string Name, bool FrameAcks = false);
+public sealed record Hello(int Version, string Secret, string Name, bool FrameAcks = false, bool Tiles = false);
+public sealed record AuthenticatedPeer(SslStream Stream, string Name, bool FrameAcks = false, bool Tiles = false);
 
 public static class SecureSession
 {
@@ -24,7 +24,7 @@ public static class SecureSession
     }
     public static string Pin(X509Certificate2 cert) => Convert.ToHexString(SHA256.HashData(cert.RawData));
 
-    public static async Task<SslStream> OpenClientAsync(Stream transport, Invitation invitation, string name, CancellationToken ct, bool frameAcks = false)
+    public static async Task<SslStream> OpenClientAsync(Stream transport, Invitation invitation, string name, CancellationToken ct, bool frameAcks = false, bool tiles = false)
     {
         if (string.IsNullOrWhiteSpace(name) || name.Length > 64 || name.Any(char.IsControl))
             throw new ArgumentException("Enter a display name of 1–64 characters.");
@@ -38,7 +38,7 @@ public static class SecureSession
                 TargetHost = "OpenDesk session", EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                 CertificateRevocationCheckMode = X509RevocationMode.NoCheck
             }, deadline.Token);
-            await Wire.WriteAsync(ssl, Wire.Json(MessageKind.Hello, new Hello(1, invitation.Secret, name.Trim(),frameAcks)), deadline.Token);
+            await Wire.WriteAsync(ssl, Wire.Json(MessageKind.Hello, new Hello(1, invitation.Secret, name.Trim(),frameAcks,tiles)), deadline.Token);
             return ssl;
         }
         catch { await ssl.DisposeAsync(); throw; }
@@ -62,7 +62,7 @@ public static class SecureSession
                 hello.Name.Length > 64 || hello.Name.Any(char.IsControl) ||
                 !CryptographicOperations.FixedTimeEquals(Convert.FromHexString(hello.Secret), Convert.FromHexString(invitation.Secret)))
                 throw new AuthenticationException("Session invitation rejected.");
-            return new(ssl, hello.Name.Trim(),hello.FrameAcks);
+            return new(ssl, hello.Name.Trim(),hello.FrameAcks,hello.Tiles);
         }
         catch { await ssl.DisposeAsync(); throw; }
     }

@@ -28,6 +28,15 @@ internal sealed class WindowsInput(Func<Rectangle> selectedMonitor) : IInputSink
     private static uint ButtonFlag(int button, bool down) => (button, down) switch {
         (1,true) => 0x2, (1,false) => 0x4, (2,true) => 0x8, (2,false) => 0x10, (3,true) => 0x20, (3,false) => 0x40, _ => 0
     };
+    // A key in the KeyCodes encoding: scan code (KEYEVENTF_SCANCODE, optionally extended) or virtual key.
+    private static Input KeyInput(int key, bool down)
+    {
+        uint up = down ? 0u : 2u;
+        var keyboard = (key & KeyCodes.VirtualKey) != 0
+            ? new KeyboardInput { Key = (ushort)(key & 0xFF), Flags = up | (Extended(key & 0xFF) ? 1u : 0u) }
+            : new KeyboardInput { Scan = (ushort)(key & 0xFF), Flags = 0x8 | up | ((key & KeyCodes.Extended) != 0 ? 1u : 0u) };
+        return new Input { Type = 1, Data = new InputUnion { Keyboard = keyboard } };
+    }
     private static bool Extended(int key) => key is 0x21 or 0x22 or 0x23 or 0x24 or 0x25 or 0x26 or 0x27 or 0x28 or 0x2d or 0x2e or 0x6f or 0x90 or 0xa3 or 0xa5 or 0x5b or 0x5c;
     public void Apply(InputEvent input)
     {
@@ -43,8 +52,11 @@ internal sealed class WindowsInput(Func<Rectangle> selectedMonitor) : IInputSink
             } } };
         }
         if (input.Kind == "key") {
-            Send(new Input { Type = 1, Data = new InputUnion { Keyboard = new KeyboardInput { Key = (ushort)input.Code, Flags = (input.Down ? 0u : 2u) | (Extended(input.Code) ? 1u : 0u) } } });
-            if (input.Down) keys.Add(input.Code); else keys.Remove(input.Code);
+            // Positional keys (v2) become scan codes; held keys are stored in the KeyCodes encoding.
+            int key = input.Key is null ? KeyCodes.VirtualKey | input.Code : KeyCodes.Lookup(input.Key) ?? 0;
+            if (key == 0) return;
+            Send(KeyInput(key, input.Down));
+            if (input.Down) keys.Add(key); else keys.Remove(key);
         }
         else if (input.Kind == "button") {
             Send(pointer!.Value,new Input { Data = new InputUnion { Mouse = new MouseInput { Flags = ButtonFlag(input.Code, input.Down) } } });
@@ -56,7 +68,7 @@ internal sealed class WindowsInput(Func<Rectangle> selectedMonitor) : IInputSink
     public void ReleaseAll()
     {
         foreach (int key in keys.ToArray()) {
-            try { Send(new Input { Type = 1, Data = new InputUnion { Keyboard = new KeyboardInput { Key = (ushort)key, Flags = 2u | (Extended(key) ? 1u : 0u) } } }); }
+            try { Send(KeyInput(key, false)); }
             catch (Win32Exception) { }
         }
         foreach (int button in buttons.ToArray()) {

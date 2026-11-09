@@ -1,0 +1,84 @@
+<!doctype html>
+<meta charset="utf-8"><title>Native probe host</title>
+<body style="margin:0;font:12px sans-serif">native host
+<script src="common.js"></script>
+<script>
+const query = new URLSearchParams(location.search);
+const codec = query.get('codec') || 'H264', width = Number(query.get('w')), height = Number(query.get('h')), fps = Number(query.get('fps') || 60);
+// Encoded size, and whether the C# Media Foundation encoder (mf) or WebCodecs here does the encoding.
+const outWidth = Number(query.get('ow') || width), outHeight = Number(query.get('oh') || height), mf = query.get('encoder') === 'mf';
+const scaler = outWidth === width ? null : new OffscreenCanvas(outWidth, outHeight).getContext('2d');
+const encoderConfigs = {
+  H264: { codec: 'avc1.640033', avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-hardware' },
+  H264SW: { codec: 'avc1.42E033', avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-software' },
+  VP8: { codec: 'vp8' },
+  VP9: { codec: 'vp09.00.41.08' },
+  AV1: { codec: 'av01.0.08M.08', hardwareAcceleration: 'prefer-hardware' },
+};
+const buffers = [], encodeStart = new Map(), encodeMs = [];
+let encoder, video, keyNext = true, dropped = 0, config, support;
+
+chrome.webview.addEventListener('sharedbufferreceived', e => { buffers[e.additionalData.index] = e.getBuffer(); });
+chrome.webview.addEventListener('message', async e => {
+  const m = e.data;
+  if (m.type === 'signal') { if (m.desc) await pc.setRemoteDescription(m.desc); if (m.candidate) await pc.addIceCandidate(m.candidate); }
+  else if (m.type === 'frame') encodeFrame(m.i);
+  else if (m.type === 'chunk') { if (video?.readyState === 'open') sendPacket(m.key, m.t, Uint8Array.from(atob(m.data), c => c.charCodeAt(0))); }
+  else if (m.type === 'stats') {
+    const sorted = [...encodeMs].sort((a, b) => a - b);
+    post({ type: 'hostStats', stats: { config, supported: support, framesEncoded: encodeMs.length, dropped,
+      avgEncodeMs: encodeMs.reduce((a, b) => a + b, 0) / encodeMs.length, p95EncodeMs: sorted[Math.ceil(sorted.length * 0.95) - 1] } });
+  }
+});
+
+function encodeFrame(i) {
+  // VideoFrame copies the pixels, so the shared buffer can go back to the capture loop at once.
+  let frame = new VideoFrame(buffers[i], { format: 'BGRA', codedWidth: width, codedHeight: height, timestamp: Math.round(performance.now() * 1000) });
+  post({ type: 'free', i });
+  if (scaler) {
+    scaler.drawImage(frame, 0, 0, outWidth, outHeight);
+    const scaled = new VideoFrame(scaler.canvas, { timestamp: frame.timestamp });
+    frame.close(); frame = scaled;
+  }
+  // Drop rather than queue: a backlog is exactly the lag being removed.
+  if (video?.readyState !== 'open' || encoder.encodeQueueSize > 1 || video.bufferedAmount > 4_000_000) { frame.close(); dropped++; return; }
+  encodeStart.set(frame.timestamp, performance.now());
+  encoder.encode(frame, { keyFrame: keyNext });
+  keyNext = false;
+  frame.close();
+}
+
+// Each encoded frame: 1 byte key flag, 8 byte timestamp, 4 byte length, then the data, split into 60 KB messages.
+function send(chunk) {
+  const started = encodeStart.get(chunk.timestamp);
+  if (started !== undefined) { encodeMs.push(performance.now() - started); encodeStart.delete(chunk.timestamp); }
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  sendPacket(chunk.type === 'key', chunk.timestamp, data);
+}
+function sendPacket(key, timestamp, data) {
+  const packet = new Uint8Array(13 + data.length), view = new DataView(packet.buffer);
+  view.setUint8(0, key ? 1 : 0); view.setFloat64(1, timestamp); view.setUint32(9, data.length);
+  packet.set(data, 13);
+  for (let offset = 0; offset < packet.length; offset += 60_000) video.send(packet.subarray(offset, Math.min(offset + 60_000, packet.length)));
+}
+
+async function start() {
+  if (!mf) {
+    config = { ...encoderConfigs[codec], width: outWidth, height: outHeight, bitrate: 12_000_000, framerate: fps, latencyMode: 'realtime' };
+    support = (await VideoEncoder.isConfigSupported(config)).supported;
+    if (!support) throw new Error(codec + ' encoder configuration is not supported');
+    encoder = new VideoEncoder({ output: send, error: e => post({ type: 'error', message: 'encoder: ' + e.message }) });
+    encoder.configure(config);
+  }
+  pc = new RTCPeerConnection();
+  pc.onicecandidate = e => e.candidate && post({ type: 'signal', candidate: e.candidate.toJSON() });
+  const dc = pc.createDataChannel('input');
+  dc.onmessage = e => { const m = JSON.parse(e.data); dc.send(JSON.stringify({ ack: m.seq })); if (m.click) post({ type: 'click', seq: m.seq }); };
+  video = pc.createDataChannel('video');
+  video.onopen = () => post({ type: 'capture' });
+  await pc.setLocalDescription();
+  post({ type: 'signal', desc: pc.localDescription.toJSON() });
+}
+post({ type: 'ready' });
+</script>

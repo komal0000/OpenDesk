@@ -19,16 +19,30 @@ if (args.Contains("--smoke")) {
 string data = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"OpenDeskServer");
 int port = 47834, relayPort = 47832;
 bool loopback=false;
+string? turnUrl=null,turnSecretFile=null;
 for (int i=0;i<args.Length;i++) {
     if (args[i] == "--data" && i+1<args.Length) data = Path.GetFullPath(args[++i]);
     else if (args[i] == "--port" && i+1<args.Length) port = int.Parse(args[++i]);
     else if (args[i] == "--relay-port" && i+1<args.Length) relayPort = int.Parse(args[++i]);
     else if(args[i]=="--loopback")loopback=true;
-    else throw new ArgumentException("Options: --data folder --port 47834 --relay-port 47832");
+    else if(args[i]=="--turn-url"&&i+1<args.Length)turnUrl=args[++i];
+    else if(args[i]=="--turn-secret-file"&&i+1<args.Length)turnSecretFile=Path.GetFullPath(args[++i]);
+    else throw new ArgumentException("Options: --data folder --port 47834 --relay-port 47832 [--turn-url host:3478 --turn-secret-file path]");
 }
 if (port is <1024 or >65535 || relayPort is <1024 or >65535 || port == relayPort) throw new ArgumentException("Choose two different ports between 1024 and 65535.");
+// TURN (coturn with use-auth-secret) lets v2 sessions cross networks where a direct path fails.
+TurnSettings? turn=null;
+if(turnUrl is not null||turnSecretFile is not null){
+    int colon=turnUrl?.LastIndexOf(':')??-1;
+    if(turnUrl is null||turnSecretFile is null||colon<1||!int.TryParse(turnUrl[(colon+1)..],out int turnPort)||turnPort is <1 or >65535||Uri.CheckHostName(turnUrl[..colon])==UriHostNameType.Unknown)
+        throw new ArgumentException("Use --turn-url host:port together with --turn-secret-file.");
+    string secret=File.ReadAllText(turnSecretFile).Trim();
+    if(secret.Length<32)throw new ArgumentException("The TURN secret must be at least 32 characters.");
+    turn=new(turnUrl[..colon],turnPort,secret);
+}
 using var identity = ServiceIdentity.Load(data);
-await using var server = await DirectoryHost.StartAsync(Path.Combine(data,"devices.json"),identity,port,relayPort,loopback);
+await using var server = await DirectoryHost.StartAsync(Path.Combine(data,"devices.json"),identity,port,relayPort,loopback,turn);
+Console.WriteLine(turn is null ? "TURN not configured: v2 sessions connect directly only (same network)." : $"TURN: {turn.Host}:{turn.Port}");
 ServiceIdentity.WritePublicConfig(data,port,SecureSession.Pin(identity));
 Console.WriteLine($"OpenDesk device service: HTTPS {port}, relay TCP {relayPort}");
 Console.WriteLine("Service certificate fingerprint: " + SecureSession.Pin(identity));

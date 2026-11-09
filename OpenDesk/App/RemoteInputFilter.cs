@@ -11,6 +11,7 @@ internal sealed class RemoteInputFilter : IMessageFilter
     internal static bool Blocks(int message, nuint extra) => extra == Marker &&
         (message is >= 0x100 and <= 0x109 or >= 0x200 and <= 0x20e);
     internal static bool IsProtected(Control? target){
+        if(target is ToolStripDropDown dropdown&&dropdown.OwnerItem?.GetCurrentParent() is {} owner)return IsProtected(owner);
         if(target?.FindForm() is ApprovalForm or ServiceSettingsForm or ViewerForm)return true;
         for(var current=target;current is not null;current=current.Parent)if(current.Tag is string tag&&tag=="LocalPermission")return true;
         return false;

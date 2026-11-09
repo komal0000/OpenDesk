@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenDesk device directory and encrypted-session relay
+Description=OpenDesk device directory, signaling and encrypted-session relay
 Wants=network-online.target
 After=network-online.target
 
@@ -8,7 +8,9 @@ Type=simple
 User=opendesk
 Group=opendesk
 WorkingDirectory=/opt/opendesk
-ExecStart=/opt/opendesk/OpenDesk.Service --data /var/lib/opendesk --port 47834 --relay-port 47832
+# setup-turn.sh writes OPENDESK_ARGS (the TURN address and secret file) to this optional file.
+EnvironmentFile=-/etc/opendesk.env
+ExecStart=/opt/opendesk/OpenDesk.Service --data /var/lib/opendesk --port 47834 --relay-port 47832 $OPENDESK_ARGS
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT

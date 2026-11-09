@@ -1,0 +1,83 @@
+<!doctype html>
+<meta charset="utf-8"><title>OpenDesk host</title>
+<script src="common.js"></script>
+<script>
+// One peer connection per approved viewer. The app approves before it sends the offer here, decides
+// what each viewer may do, and supplies encoded video, which this page fans out to every peer.
+const peers = new Map(); // session -> { pc, channels, needKey }
+let keyAsked = -1000;
+
+chrome.webview.addEventListener('message', e => {
+  const m = e.data;
+  if (m.t === 'offer') answer(m.session, m.sdp, m.ice).catch(err => { close(m.session); post({ t: 'error', message: String(err?.message ?? err) }); });
+  else if (m.t === 'send') sendWithAck(peers.get(m.session)?.channels[m.ch], fromBase64(m.data), m.ack);
+  else if (m.t === 'video') fanOut(m);
+  else if (m.t === 'close') close(m.session);
+});
+
+async function answer(session, sdp, iceServers) {
+  const pc = new RTCPeerConnection({ iceServers });
+  const peer = { pc, channels: {}, needKey: true };
+  peers.set(session, peer);
+  pc.ondatachannel = e => {
+    const channel = e.channel;
+    channel.binaryType = 'arraybuffer';
+    peer.channels[channel.label] = channel;
+    channel.onclose = () => failAcks(channel);
+    if (channel.label === 'video') { channel.onopen = askKeyframe; if (channel.readyState === 'open') askKeyframe(); return; }
+    channel.onmessage = m => post({ t: 'recv', session, ch: channel.label, data: toBase64(new Uint8Array(m.data)) });
+    if (channel.label === 'control') {
+      const opened = () => post({ t: 'open', session });
+      if (channel.readyState === 'open') opened(); else channel.onopen = opened;
+    }
+  };
+  pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' || pc.connectionState === 'closed') close(session); };
+  await pc.setRemoteDescription({ type: 'offer', sdp });
+  await pc.setLocalDescription();
+  await gathered(pc);
+  if (peers.get(session) === peer) post({ t: 'answer', session, sdp: pc.localDescription.sdp });
+}
+
+// Always reports 'closed', so the app forgets a session even when its connection was never created.
+function close(session) {
+  const peer = peers.get(session);
+  if (!peer) { post({ t: 'closed', session }); return; }
+  peers.delete(session);
+  for (const channel of Object.values(peer.channels)) failAcks(channel);
+  peer.pc.close();
+  post({ t: 'closed', session });
+}
+
+// Every approved peer gets each frame unless its video channel is backed up; a backed-up or new peer
+// skips frames until the next keyframe. The app's video pipeline paces keyframes; this only avoids
+// asking on every frame.
+function askKeyframe() {
+  const now = performance.now();
+  if (now - keyAsked < 250) return;
+  keyAsked = now;
+  post({ t: 'keyframe' });
+}
+function fanOut(m) {
+  const length = decodedLength(m.data), packet = new Uint8Array(VIDEO_HEADER + length), view = new DataView(packet.buffer);
+  view.setUint8(0, m.key ? 1 : 0); view.setFloat64(1, m.display); view.setFloat64(9, performance.now()); view.setUint32(17, length);
+  fromBase64(m.data, packet, VIDEO_HEADER);
+  for (const peer of peers.values()) {
+    const channel = peer.channels.video;
+    if (channel?.readyState !== 'open') continue;
+    if (channel.bufferedAmount > 1048576) peer.needKey = true;
+    if (peer.needKey && !m.key) { askKeyframe(); continue; }
+    peer.needKey = false;
+    for (let offset = 0; offset < packet.length; offset += VIDEO_PIECE) channel.send(packet.subarray(offset, Math.min(offset + VIDEO_PIECE, packet.length)));
+  }
+}
+
+// Route per viewer, for the host's list of connected viewers.
+setInterval(async () => {
+  for (const [session, peer] of peers) {
+    if (peer.pc.connectionState !== 'connected') continue;
+    const r = await route(peer.pc);
+    if (r) post({ t: 'route', session, relay: r.relay, rtt: r.rtt });
+  }
+}, 2000);
+post({ t: 'ready' });
+</script>

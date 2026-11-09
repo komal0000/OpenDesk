@@ -16,6 +16,9 @@ internal sealed class ClientSettings
     public string DisplayName { get; set; } = Environment.UserName;
     public int VideoQuality {get;set;}=1;
     public List<Contact> Contacts { get; set; } = [];
+    // Device address -> SHA-256 of the device key first seen there (trust on first use). Only removing
+    // the contact forgets it, so renaming or re-adding a device cannot silently reset trust.
+    public Dictionary<string,string> KnownKeys { get; set; } = [];
     public static ClientSettings Load(string? storageFile = null)
     {
         string file = storageFile ?? Path.Combine(Folder,"settings.json");
@@ -26,6 +29,7 @@ internal sealed class ClientSettings
         settings.ServiceUrl??="";settings.ServicePin??="";settings.DeviceId??="";settings.DisplayName=string.IsNullOrWhiteSpace(settings.DisplayName)?Environment.UserName:settings.DisplayName;
         if(settings.DeviceId.Length!=9||settings.DeviceId.Any(c=>c<'0'||c>'9'))settings.DeviceId="";
         settings.Contacts=(settings.Contacts??[]).Where(c=>c is not null&&c.Id is{Length:9}&&c.Id.All(d=>d>='0'&&d<='9')&&!string.IsNullOrWhiteSpace(c.Name)).Take(200).ToList();
+        settings.KnownKeys=(settings.KnownKeys??[]).Where(p=>p.Key is{Length:9}&&p.Key.All(d=>d>='0'&&d<='9')&&OpenDesk.Core.Invitation.IsHex(p.Value,64)).Take(1000).ToDictionary();
         if (string.IsNullOrWhiteSpace(settings.ServiceUrl)) {
             settings.ServiceUrl = DefaultServiceUrl;
             settings.ServicePin = DefaultServicePin;
@@ -48,10 +52,11 @@ internal sealed class ClientSettings
         string file = StorageFile ?? Path.Combine(Folder,"settings.json");Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(file))!);
         File.WriteAllText(file + ".tmp",JsonSerializer.Serialize(this)); File.Move(file + ".tmp",file,true);
     }
-    public void Remember(string id, string name)
+    public void Remember(string id, string name, string keyPin)
     {
         var old = Contacts.FirstOrDefault(c => c.Id == id);
         Contacts.RemoveAll(c => c.Id == id);
+        KnownKeys[id] = keyPin;
         Contacts.Insert(0,new(id,old?.Name ?? name,old?.Favorite ?? false,DateTimeOffset.UtcNow));
         Contacts = Contacts.Take(200).ToList(); Save();
     }

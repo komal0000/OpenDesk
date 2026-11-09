@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8"><title>Native probe viewer</title>
+<body style="margin:0;background:#222">
+<canvas id="screen" width="960" height="540" style="width:100%"></canvas>
+<canvas id="pixels" width="4" height="4" hidden></canvas>
+<script src="common.js"></script>
+<script>
+const query = new URLSearchParams(location.search);
+const decoderCodecs = { H264: 'avc1.640033', H264SW: 'avc1.42E033', VP8: 'vp8', VP9: 'vp09.00.41.08', AV1: 'av01.0.08M.08' };
+const screen = document.getElementById('screen').getContext('2d');
+const pixels = document.getElementById('pixels').getContext('2d', { willReadFrequently: true });
+const sent = {}, dcRtt = [], seen = [], decodeStart = new Map(), decodeMs = [];
+let dc, firstFrame = false, marker = null, waiter = null, started = false, pending = null, filled = 0;
+
+const decoder = new VideoDecoder({ output: onFrame, error: e => post({ type: 'error', message: 'decoder: ' + e.message }) });
+decoder.configure({ codec: decoderCodecs[query.get('codec') || 'H264'], optimizeForLatency: true });
+
+pc = new RTCPeerConnection();
+pc.onicecandidate = e => e.candidate && post({ type: 'signal', candidate: e.candidate.toJSON() });
+pc.ondatachannel = e => {
+  if (e.channel.label === 'video') { e.channel.binaryType = 'arraybuffer'; e.channel.onmessage = m => onPiece(new Uint8Array(m.data)); return; }
+  dc = e.channel;
+  dc.onmessage = m => { const { ack } = JSON.parse(m.data); dcRtt.push(performance.now() - sent[ack]); };
+  dc.onopen = live;
+};
+function live() { if (firstFrame && dc?.readyState === 'open') post({ type: 'live' }); }
+
+// Reassembles one encoded frame from its 60 KB pieces; the channel is ordered and reliable.
+function onPiece(piece) {
+  if (!pending) {
+    const view = new DataView(piece.buffer, piece.byteOffset);
+    pending = new Uint8Array(13 + view.getUint32(9)); filled = 0;
+  }
+  pending.set(piece, filled); filled += piece.length;
+  if (filled < pending.length) return;
+  const packet = pending, view = new DataView(packet.buffer); pending = null;
+  const key = view.getUint8(0) === 1, timestamp = view.getFloat64(1);
+  if (!started && !key) return;
+  started = true;
+  decodeStart.set(timestamp, performance.now());
+  decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp, data: packet.subarray(13) }));
+}
+
+function onFrame(frame) {
+  const begun = decodeStart.get(frame.timestamp);
+  if (begun !== undefined) { decodeMs.push(performance.now() - begun); decodeStart.delete(frame.timestamp); }
+  let l = 0;
+  if (marker) {
+    pixels.drawImage(frame, marker.x * frame.displayWidth - 2, marker.y * frame.displayHeight - 2, 4, 4, 0, 0, 4, 4);
+    const d = pixels.getImageData(0, 0, 4, 4).data;
+    for (let i = 0; i < d.length; i += 4) l += (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) / 16;
+  }
+  screen.drawImage(frame, 0, 0, 960, 540);
+  frame.close();
+  const t = performance.now();
+  if (!firstFrame) { firstFrame = true; live(); }
+  if (waiter) { const resolve = waiter; waiter = null; resolve({ t, l }); }
+}
+
+// Desktop Duplication sends nothing while the screen is still, so a frame wait can time out.
+const nextFrame = () => new Promise(resolve => { waiter = resolve; setTimeout(() => { if (waiter === resolve) { waiter = null; resolve(null); } }, 3000); });
+async function waitFor(white, timeout) {
+  const start = performance.now(); let low = 255, high = 0, frames = 0;
+  try {
+    while (performance.now() - start < timeout) {
+      const f = await nextFrame();
+      if (f === null) continue;
+      frames++; low = Math.min(low, f.l); high = Math.max(high, f.l);
+      if (white ? f.l > 180 : f.l < 70) return f.t;
+    }
+    return null;
+  } finally { seen.push([Math.round(low), Math.round(high), frames]); }
+}
+
+chrome.webview.addEventListener('message', async e => {
+  const m = e.data;
+  if (m.type === 'signal') {
+    if (m.desc) { await pc.setRemoteDescription(m.desc); await pc.setLocalDescription(); post({ type: 'signal', desc: pc.localDescription.toJSON() }); }
+    if (m.candidate) await pc.addIceCandidate(m.candidate);
+  }
+  else if (m.type === 'marker') { marker = m; run(); }
+});
+
+async function run() {
+  await new Promise(r => setTimeout(r, 2000));
+  // The marker starts black; a still screen sends no frames, so a timeout here is fine.
+  const clicks = []; let white = false, failed = null;
+  for (let seq = 1; seq <= marker.samples; seq++) {
+    white = !white;
+    const t0 = sent[seq] = performance.now();
+    dc.send(JSON.stringify({ seq, click: true }));
+    const t1 = await waitFor(white, 3000);
+    if (t1 === null) { failed = `Click ${seq}: marker change not seen in the video; was the probe window covered?`; break; }
+    clicks.push(t1 - t0);
+    await new Promise(r => setTimeout(r, 150 + Math.random() * 150));
+  }
+  const sorted = [...decodeMs].sort((a, b) => a - b);
+  post({ type: 'result', failed, clicks, dcRtt, seen, marker, stats: { framesDecoded: decodeMs.length,
+    avgDecodeMs: decodeMs.reduce((a, b) => a + b, 0) / decodeMs.length, p95DecodeMs: sorted[Math.ceil(sorted.length * 0.95) - 1] } });
+}
+post({ type: 'ready' });
+</script>
